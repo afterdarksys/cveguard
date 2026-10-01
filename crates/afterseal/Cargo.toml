@@ -9,6 +9,7 @@ description = "Toolchain SHA-256 pin and census for cveguard"
 
 [dependencies]
 cveguard-proto.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

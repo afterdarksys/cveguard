@@ -27,17 +27,10 @@ pub fn open_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-pub fn current_uid() -> Option<u32> {
-    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("Uid:") {
-                return rest.split_whitespace().nth(1).and_then(|v| v.parse().ok());
-            }
-        }
-    }
-    std::env::var_os("HOME")
-        .and_then(|home| std::fs::metadata(home).ok())
-        .map(|md| md.uid())
+/// Effective uid from the kernel. Never inferred from `$HOME` or procfs.
+#[must_use]
+pub fn current_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 pub fn read_trusted(path: &Path, max: usize, policy: FilePolicy) -> Result<Vec<u8>, Error> {
@@ -56,10 +49,8 @@ pub fn check_metadata(md: &std::fs::Metadata, policy: FilePolicy) -> Result<(), 
         return Err(invalid("not a regular file"));
     }
     let owner = md.uid();
-    match current_uid() {
-        Some(uid) if owner == uid || owner == 0 => {}
-        None if owner == 0 => {}
-        _ => return Err(invalid("owner rejected")),
+    if owner != 0 && owner != current_uid() {
+        return Err(invalid("owner rejected"));
     }
     let mode = md.permissions().mode() & 0o777;
     match policy {
@@ -176,5 +167,31 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn current_uid_ignores_home_owner() {
+        // Re-run this test in a child with HOME=/ (owned by root). The old
+        // $HOME-owner fallback reported uid 0 there on hosts without procfs.
+        if std::env::var_os("CVEGUARD_UID_PROBE").is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("owned");
+            std::fs::write(&path, b"x").unwrap();
+            let owner = std::fs::metadata(&path).unwrap().uid();
+            assert_eq!(current_uid(), owner);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "fs::tests::current_uid_ignores_home_owner",
+                "--quiet",
+            ])
+            .env("CVEGUARD_UID_PROBE", "1")
+            .env("HOME", "/")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

@@ -1,4 +1,4 @@
-//! afteralert CLI. The accept loop lives in `dispatch` and is not used by tests.
+//! afteralert CLI.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

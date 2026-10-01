@@ -3,13 +3,19 @@
 //! Threats: an enforce decision on imported intel, on a toolchain descendant,
 //! or after a seal mismatch would act on untrusted or self-referential input.
 //! The budget fails closed. Isolate output is a plan string.
+//!
+//! Protection is by verified identity only: the event's `exe`, or an
+//! ancestor's recorded exe, must be exactly a canonical path whose digest the
+//! seal verified, with the same dev/ino now. `comm` and basenames never
+//! protect, so `/tmp/.x/afterseal` or `comm=nocved` cannot exempt itself.
+//! With no valid seal nothing is protected.
 
 use cveguard_proto::isolate::{self, IsolateSpec};
 use cveguard_proto::model::{
-    Action, ActionBudget, Decision, GuardEvent, Kind, Mode, Origin, Outcome, Reason, Rule,
-    SCHEMA_VERSION, basename, is_toolchain_basename, predicate_matches, subject_of, validate_event,
+    Action, ActionBudget, DECISION_SCHEMA_VERSION, Decision, GuardEvent, Kind, Mode, Origin,
+    Outcome, Reason, Rule, Severity, predicate_matches, subject_of, validate_event,
 };
-use cveguard_proto::seal::SealStatus;
+use cveguard_proto::seal::{SealCheck, SealStatus, Sealed};
 
 use crate::container::ContainerIndex;
 use crate::lineage::Lineage;
@@ -24,6 +30,7 @@ pub struct Engine {
     isolate: IsolateSpec,
     budget: ActionBudget,
     seal: SealStatus,
+    sealed: Sealed,
     seal_alerted: bool,
     halted: bool,
 }
@@ -35,7 +42,7 @@ impl Engine {
         mode: Mode,
         isolate: IsolateSpec,
         budget: ActionBudget,
-        seal: SealStatus,
+        seal: SealCheck,
     ) -> Self {
         Self {
             lineage: Lineage::new(),
@@ -44,7 +51,8 @@ impl Engine {
             mode,
             isolate,
             budget,
-            seal,
+            seal: seal.status,
+            sealed: seal.sealed,
             seal_alerted: false,
             halted: false,
         }
@@ -58,6 +66,49 @@ impl Engine {
     #[must_use]
     pub fn seal_status(&self) -> SealStatus {
         self.seal
+    }
+
+    /// Replaces the seal result after a periodic re-verification. A new
+    /// mismatch makes `take_seal_alert` fire once and halts evaluation.
+    pub fn update_seal(&mut self, check: SealCheck) {
+        self.seal = check.status;
+        self.sealed = if check.status == SealStatus::Valid {
+            check.sealed
+        } else {
+            Sealed::default()
+        };
+    }
+
+    /// A `rejected` / `schema` row for an input line that did not parse.
+    #[must_use]
+    pub fn reject_line(&self, observed_at_ms: i64) -> Option<Decision> {
+        if self.halted {
+            return None;
+        }
+        Some(bare(
+            observed_at_ms,
+            Action::Record,
+            Outcome::Rejected,
+            Reason::Schema,
+            Severity::Low,
+        ))
+    }
+
+    /// A `record` / `rejected` / `feed_gap` row: the tail lost an unread
+    /// stretch of the feed. High, because a hidden process start is exactly
+    /// what a lost stretch can contain.
+    #[must_use]
+    pub fn feed_gap(&self, observed_at_ms: i64) -> Option<Decision> {
+        if self.halted {
+            return None;
+        }
+        Some(bare(
+            observed_at_ms,
+            Action::Record,
+            Outcome::Rejected,
+            Reason::FeedGap,
+            Severity::High,
+        ))
     }
 
     #[must_use]
@@ -77,20 +128,16 @@ impl Engine {
         }
         self.seal_alerted = true;
         self.halted = true;
-        Some(Decision {
-            schema_version: SCHEMA_VERSION,
-            observed_at_ms: 0,
-            action: Action::Alert,
-            outcome: Outcome::Noted,
-            reason: Reason::SealMismatch,
-            origin: Origin::Ring,
-            plan: None,
-            pid: None,
-            rule_id: None,
-            cve: None,
-            subject: Some("afterseal".to_owned()),
-            ancestors: Vec::new(),
-        })
+        let mut alert = bare(
+            0,
+            Action::Alert,
+            Outcome::Noted,
+            Reason::SealMismatch,
+            Severity::Critical,
+        );
+        alert.origin = Origin::Ring;
+        alert.subject = Some("afterseal".to_owned());
+        Some(alert)
     }
 
     pub fn evaluate(&mut self, event: &GuardEvent) -> Option<Decision> {
@@ -177,7 +224,7 @@ impl Engine {
                 );
             }
         };
-        if is_protected(ev, full) {
+        if is_protected(ev, full, &self.sealed) {
             return decided(
                 ev,
                 rule,
@@ -273,7 +320,7 @@ impl Engine {
         stored: &[String],
     ) -> Decision {
         let action = rule.action;
-        if is_protected(ev, full) {
+        if is_protected(ev, full, &self.sealed) {
             return decided(
                 ev,
                 rule,
@@ -325,37 +372,57 @@ impl Engine {
     }
 }
 
-fn is_protected(ev: &GuardEvent, ancestors: &[String]) -> bool {
-    if ev
-        .exe
-        .as_deref()
-        .is_some_and(|exe| is_toolchain_basename(basename(exe)))
-    {
-        return true;
+/// Sealed identity only. `comm` is ignored; a basename is never enough.
+fn is_protected(ev: &GuardEvent, ancestors: &[String], sealed: &Sealed) -> bool {
+    ev.exe.as_deref().is_some_and(|exe| sealed.protects(exe))
+        || ancestors.iter().any(|exe| sealed.protects(exe))
+}
+
+/// A row with no rule and no event. `epoch`, `seq`, and `prev` are set by
+/// the ledger writer.
+fn bare(
+    observed_at_ms: i64,
+    action: Action,
+    outcome: Outcome,
+    reason: Reason,
+    severity: Severity,
+) -> Decision {
+    Decision {
+        schema_version: DECISION_SCHEMA_VERSION,
+        epoch: None,
+        seq: 0,
+        prev: String::new(),
+        observed_at_ms,
+        action,
+        outcome,
+        reason,
+        origin: Origin::Nocved,
+        severity,
+        plan: None,
+        pid: None,
+        rule_id: None,
+        source_rule_id: None,
+        cve: None,
+        subject: None,
+        comm_invalid: false,
+        args_truncated: false,
+        ancestors: Vec::new(),
     }
-    if ev.comm.as_deref().is_some_and(is_toolchain_basename) {
-        return true;
-    }
-    ancestors
-        .iter()
-        .any(|exe| is_toolchain_basename(basename(exe)))
 }
 
 fn schema_decision(ev: &GuardEvent) -> Decision {
-    Decision {
-        schema_version: SCHEMA_VERSION,
-        observed_at_ms: ev.observed_at_ms,
-        action: Action::Record,
-        outcome: Outcome::Rejected,
-        reason: Reason::Schema,
-        origin: ev.origin,
-        plan: None,
-        pid: ev.pid,
-        rule_id: None,
-        cve: None,
-        subject: subject_of(ev),
-        ancestors: Vec::new(),
-    }
+    let mut row = bare(
+        ev.observed_at_ms,
+        Action::Record,
+        Outcome::Rejected,
+        Reason::Schema,
+        Severity::Low,
+    );
+    row.origin = ev.origin;
+    row.pid = ev.pid;
+    row.subject = subject_of(ev);
+    row.comm_invalid = ev.comm_invalid;
+    row
 }
 
 fn decided(
@@ -368,17 +435,24 @@ fn decided(
     ancestors: &[String],
 ) -> Decision {
     Decision {
-        schema_version: SCHEMA_VERSION,
+        schema_version: DECISION_SCHEMA_VERSION,
+        epoch: None,
+        seq: 0,
+        prev: String::new(),
         observed_at_ms: ev.observed_at_ms,
         action,
         outcome,
         reason,
         origin: ev.origin,
+        severity: rule.severity.unwrap_or_default(),
         plan,
         pid: ev.pid,
         rule_id: Some(rule.id.clone()),
+        source_rule_id: ev.source_rule_id.clone(),
         cve: rule.cve.clone(),
         subject: subject_of(ev),
+        comm_invalid: ev.comm_invalid,
+        args_truncated: ev.args_truncated,
         ancestors: ancestors.to_vec(),
     }
 }
@@ -386,7 +460,32 @@ fn decided(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cveguard_proto::model::Predicate;
+    use cveguard_proto::model::{Predicate, SCHEMA_VERSION, basename};
+    use cveguard_proto::seal::{self, CENSUS};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Six real files, pinned and verified. Returns the canonical paths.
+    fn sealed_toolchain() -> (tempfile::TempDir, SealCheck, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut paths = Vec::new();
+        for name in CENSUS {
+            let path = root.join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            paths.push(path);
+        }
+        let manifest = seal::pin(&paths).unwrap();
+        let seal_path = root.join("seal.json");
+        seal::write_manifest(&seal_path, &manifest).unwrap();
+        let check = seal::check(&seal_path);
+        assert_eq!(check.status, SealStatus::Valid);
+        let text = paths
+            .iter()
+            .map(|p| p.to_str().unwrap().to_owned())
+            .collect();
+        (dir, check, text)
+    }
 
     fn isolate_spec() -> IsolateSpec {
         IsolateSpec {
@@ -406,6 +505,7 @@ mod tests {
             action,
             mode,
             cve: None,
+            severity: None,
             when: vec![pred],
         }
     }
@@ -421,8 +521,11 @@ mod tests {
             uid: Some(0),
             exe: Some(exe.to_owned()),
             comm: Some(basename(exe).to_owned()),
+            comm_invalid: false,
             args: Vec::new(),
+            args_truncated: false,
             remote: None,
+            local: None,
             package: None,
             version: None,
             container_id: None,
@@ -430,6 +533,7 @@ mod tests {
             runtime: None,
             severity: None,
             ancestors: Vec::new(),
+            source_rule_id: None,
         }
     }
 
@@ -439,7 +543,7 @@ mod tests {
             mode,
             isolate_spec(),
             ActionBudget::new(60_000, max_actions).unwrap(),
-            seal,
+            SealCheck::of(seal),
         )
     }
 
@@ -570,36 +674,48 @@ mod tests {
         assert!(!text.contains("password"));
     }
 
-    #[test]
-    fn protected_toolchain_and_deep_descendant_are_suppressed() {
-        let rules = vec![rule(
-            "any-exe",
-            true,
-            Action::Alert,
+    fn sealed_engine(rules: Vec<Rule>, check: SealCheck) -> Engine {
+        Engine::new(
+            rules,
             Mode::Enforce,
-            Predicate::ExeBasename {
-                equals: "nocved".to_owned(),
-            },
-        )];
-        let mut engine = make(rules, Mode::Enforce, SealStatus::Valid, 10);
-        let decision = engine
-            .evaluate(&exec("/usr/sbin/nocved", Origin::Ring))
-            .unwrap();
+            isolate_spec(),
+            ActionBudget::new(60_000, 10).unwrap(),
+            check,
+        )
+    }
+
+    fn alert(id: &str, pred: Predicate) -> Vec<Rule> {
+        vec![rule(id, true, Action::Alert, Mode::Enforce, pred)]
+    }
+
+    #[test]
+    fn sealed_path_and_sealed_ancestor_are_suppressed() {
+        let (_dir, check, paths) = sealed_toolchain();
+        let nocved = paths[0].clone();
+        let mut engine = sealed_engine(
+            alert(
+                "any-exe",
+                Predicate::ExeBasename {
+                    equals: "nocved".to_owned(),
+                },
+            ),
+            check.clone(),
+        );
+        let decision = engine.evaluate(&exec(&nocved, Origin::Ring)).unwrap();
         assert_eq!(decision.outcome, Outcome::Suppressed);
         assert_eq!(decision.reason, Reason::Protected);
         assert!(decision.plan.is_none());
 
-        let rules = vec![rule(
-            "miner-exe",
-            true,
-            Action::Alert,
-            Mode::Enforce,
-            Predicate::ExeBasename {
-                equals: "xmrig".to_owned(),
-            },
-        )];
-        let mut engine = make(rules, Mode::Enforce, SealStatus::Valid, 10);
-        engine.lineage.observe_start(1, 0, "/usr/sbin/nocved");
+        let mut engine = sealed_engine(
+            alert(
+                "miner-exe",
+                Predicate::ExeBasename {
+                    equals: "xmrig".to_owned(),
+                },
+            ),
+            check,
+        );
+        engine.lineage.observe_start(1, 0, &nocved);
         for pid in 2..10 {
             engine
                 .lineage
@@ -612,12 +728,93 @@ mod tests {
         assert_eq!(decision.outcome, Outcome::Suppressed);
         assert_eq!(decision.reason, Reason::Protected);
         assert_eq!(decision.ancestors.len(), STORED_ANCESTORS);
-        assert!(
-            decision
-                .ancestors
-                .iter()
-                .all(|exe| !exe.ends_with("nocved"))
+        assert!(decision.ancestors.iter().all(|exe| *exe != nocved));
+    }
+
+    #[test]
+    fn probe_comm_named_like_toolchain_is_not_protected() {
+        // exe=/tmp/xmrig name=nocved
+        let (_dir, check, _paths) = sealed_toolchain();
+        let mut engine = sealed_engine(
+            alert(
+                "miner-exe",
+                Predicate::ExeBasename {
+                    equals: "xmrig".to_owned(),
+                },
+            ),
+            check,
         );
+        let mut ev = exec("/tmp/xmrig", Origin::Ring);
+        ev.comm = Some("nocved".to_owned());
+        let decision = engine.evaluate(&ev).unwrap();
+        assert_eq!(decision.outcome, Outcome::Noted);
+        assert_eq!(decision.reason, Reason::Matched);
+    }
+
+    #[test]
+    fn probe_unsealed_ancestor_named_like_toolchain_is_not_protected() {
+        // ancestor at /dev/shm/aftercve
+        let (_dir, check, _paths) = sealed_toolchain();
+        let mut engine = sealed_engine(
+            alert(
+                "miner-exe",
+                Predicate::ExeBasename {
+                    equals: "xmrig".to_owned(),
+                },
+            ),
+            check,
+        );
+        engine.lineage.observe_start(30, 1, "/dev/shm/aftercve");
+        let mut ev = exec("/tmp/xmrig", Origin::Ring);
+        ev.pid = Some(31);
+        ev.ppid = Some(30);
+        let decision = engine.evaluate(&ev).unwrap();
+        assert_eq!(decision.ancestors, vec!["/dev/shm/aftercve".to_owned()]);
+        assert_eq!(decision.outcome, Outcome::Noted);
+        assert_eq!(decision.reason, Reason::Matched);
+    }
+
+    #[test]
+    fn probe_unsealed_exe_named_like_toolchain_is_not_protected() {
+        // /tmp/.x/afterseal connecting to a miner port
+        let (_dir, check, _paths) = sealed_toolchain();
+        let mut engine = sealed_engine(
+            vec![rule(
+                "miner-port",
+                true,
+                Action::Isolate,
+                Mode::Enforce,
+                Predicate::RemoteEquals {
+                    equals: "192.0.2.99:3333".to_owned(),
+                },
+            )],
+            check,
+        );
+        let mut ev = exec("/tmp/.x/afterseal", Origin::Ring);
+        ev.kind = Kind::Connect;
+        ev.remote = Some("192.0.2.99:3333".to_owned());
+        let decision = engine.evaluate(&ev).unwrap();
+        assert_eq!(decision.outcome, Outcome::Planned);
+        assert_eq!(decision.reason, Reason::Matched);
+        assert!(decision.plan.is_some());
+    }
+
+    #[test]
+    fn nothing_is_protected_without_a_valid_seal() {
+        let (_dir, _check, paths) = sealed_toolchain();
+        let mut engine = make(
+            alert(
+                "any-exe",
+                Predicate::ExeBasename {
+                    equals: "nocved".to_owned(),
+                },
+            ),
+            Mode::Shadow,
+            SealStatus::Missing,
+            10,
+        );
+        let decision = engine.evaluate(&exec(&paths[0], Origin::Ring)).unwrap();
+        assert_ne!(decision.reason, Reason::Protected);
     }
 
     #[test]
@@ -658,11 +855,67 @@ mod tests {
             Mode::Shadow,
             spec,
             ActionBudget::new(60_000, 10).unwrap(),
-            SealStatus::Missing,
+            SealCheck::of(SealStatus::Missing),
         );
         let decision = engine.evaluate(&exec("/tmp/xmrig", Origin::Ring)).unwrap();
         assert_eq!(decision.outcome, Outcome::Rejected);
         assert_eq!(decision.reason, Reason::PlanInvalid);
         assert!(decision.plan.is_none());
+    }
+
+    /// The e2e rule pack (rules.json from the live run) with a severity on
+    /// the masquerade rule.
+    const E2E_RULES: &[u8] = br#"[
+      {"id":"masq-kcompactd","enabled":true,"action":"alert","mode":"enforce","severity":"high","when":[{"op":"exe_basename","equals":"kcompactd0"}]},
+      {"id":"sleep-comm","enabled":true,"action":"alert","mode":"shadow","when":[{"op":"comm_equals","equals":"sleep"}]}
+    ]"#;
+
+    #[test]
+    fn e2e_padded_miner_is_decided_with_severity_and_source_rule() {
+        let rules = cveguard_proto::model::parse_rules(E2E_RULES).unwrap();
+        let mut engine = make(rules, Mode::Shadow, SealStatus::Missing, 10);
+        let burst = include_str!("../../cveguard-proto/testdata/e2e_miner_burst.jsonl");
+        let decisions: Vec<Decision> = burst
+            .lines()
+            .filter_map(|line| cveguard_proto::intel::ingest_line(line).unwrap())
+            .filter_map(|ev| engine.evaluate(&ev))
+            .collect();
+        // seq 534 (2 args) and seq 535 (70 args, masked to 65) both decided.
+        assert_eq!(decisions.len(), 2);
+        for d in &decisions {
+            assert_eq!(d.rule_id.as_deref(), Some("masq-kcompactd"));
+            assert_eq!(d.severity, Severity::High);
+            assert_eq!(d.source_rule_id.as_deref(), Some("proc.masquerade"));
+            assert_eq!(d.reason, Reason::ImportedIntel);
+            assert_eq!(d.subject.as_deref(), Some("kcompactd0"));
+        }
+        assert_eq!(decisions[0].pid, Some(8126));
+        assert!(!decisions[0].args_truncated);
+        assert_eq!(decisions[1].pid, Some(8128));
+        assert!(decisions[1].args_truncated);
+        let row = serde_json::to_string(&decisions[1]).unwrap();
+        assert!(row.contains(r#""args_truncated":true"#));
+        assert!(!row.contains("\"10\""));
+    }
+
+    #[test]
+    fn rule_without_severity_is_medium_and_bad_severity_is_refused() {
+        let rules = vec![rule(
+            "miner-exe",
+            true,
+            Action::Alert,
+            Mode::Enforce,
+            Predicate::ExeBasename {
+                equals: "xmrig".to_owned(),
+            },
+        )];
+        let mut engine = make(rules, Mode::Shadow, SealStatus::Missing, 10);
+        let d = engine.evaluate(&exec("/tmp/xmrig", Origin::Ring)).unwrap();
+        assert_eq!(d.severity, Severity::Medium);
+        assert_eq!(d.source_rule_id, None);
+        let bad = br#"[{"id":"a","enabled":true,"action":"alert","mode":"shadow","severity":"urgent","when":[{"op":"comm_equals","equals":"x"}]}]"#;
+        assert!(cveguard_proto::model::parse_rules(bad).is_err());
+        assert_eq!(engine.feed_gap(1).unwrap().severity, Severity::High);
+        assert_eq!(engine.reject_line(1).unwrap().severity, Severity::Low);
     }
 }

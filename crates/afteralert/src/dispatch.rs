@@ -1,4 +1,5 @@
-//! `afteralert` commands. Tests call `serve_one`, never the accept loop.
+//! `afteralert` commands. Tests drive `serve_listener` on an ephemeral
+//! loopback port with a connection limit, never the unbounded `serve`.
 //!
 //! Threats: a duplicated flag or a value that looks like a flag is rejected
 //! so the listen address cannot be swapped by a typo.

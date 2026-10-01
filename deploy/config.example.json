@@ -2,6 +2,11 @@
   "mode": "shadow",
   "enabled": true,
   "rules": "rules.example.json",
+  "events": "/var/lib/nocved/cveguard-feed/events.jsonl",
+  "ledger": "/var/lib/cveguard/decisions.jsonl",
+  "status": "/var/lib/cveguard/status.json",
+  "seal": "/var/lib/cveguard/seal.json",
+  "seal_recheck_passes": 60,
   "isolate": {
     "local_cidrs": ["10.1.2.0/24"],
     "whitelist": ["192.0.2.20/32"],
@@ -9,6 +14,10 @@
     "store_ips": ["198.51.100.8"],
     "keep_store": true,
     "deadman_secs": 120
+  },
+  "ship": {
+    "socket": "/run/darksignal/darksignal.sock",
+    "host": "ns2"
   },
   "capabilities": []
 }

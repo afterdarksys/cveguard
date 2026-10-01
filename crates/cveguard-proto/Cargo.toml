@@ -15,6 +15,7 @@ subtle = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -7,6 +7,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod chain;
 pub mod cidr;
 pub mod error;
 pub mod fs;
@@ -18,5 +19,6 @@ pub mod seal;
 
 pub use error::Error;
 pub use model::{
-    Action, ActionBudget, Decision, GuardEvent, Mode, Origin, Outcome, Reason, Rule, SCHEMA_VERSION,
+    Action, ActionBudget, DECISION_SCHEMA_VERSION, Decision, GuardEvent, Mode, Origin, Outcome,
+    Reason, Rule, SCHEMA_VERSION,
 };

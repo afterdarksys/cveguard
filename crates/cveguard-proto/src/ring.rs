@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::error::{Error, schema};
 use crate::model::{
     GuardEvent, Kind, MAX_RING_PAYLOAD, Origin, SCHEMA_VERSION, check_remote, check_text,
-    filter_args, valid_subject,
+    filter_args, normalize_comm, valid_subject,
 };
 
 pub const MAGIC: u32 = 0x3152_4743;
@@ -188,9 +188,9 @@ fn opt_string(v: &Value, key: &str) -> Result<Option<String>, Error> {
     }
 }
 
-fn args_of(v: &Value) -> Result<Vec<String>, Error> {
+fn args_of(v: &Value) -> Result<(Vec<String>, bool), Error> {
     match v.get("args") {
-        None | Some(Value::Null) => Ok(Vec::new()),
+        None | Some(Value::Null) => Ok((Vec::new(), false)),
         Some(Value::Array(items)) => {
             let mut out = Vec::new();
             for item in items {
@@ -199,7 +199,7 @@ fn args_of(v: &Value) -> Result<Vec<String>, Error> {
                     _ => return Err(schema("field rejected")),
                 }
             }
-            filter_args(out)
+            Ok(filter_args(out))
         }
         _ => Err(schema("field rejected")),
     }
@@ -219,12 +219,7 @@ pub fn record_to_event(rec: &Record, now_ms: i64) -> Result<GuardEvent, Error> {
         KIND_CONNECT => Kind::Connect,
         _ => return Err(schema("kind rejected")),
     };
-    let mut comm = opt_string(&v, "comm")?;
-    if let Some(name) = &comm
-        && !valid_subject(name)
-    {
-        return Err(schema("subject rejected"));
-    }
+    let (mut comm, comm_invalid) = normalize_comm(v.get("comm"));
     let exe = opt_string(&v, "exe")?;
     let remote = opt_string(&v, "remote")?;
     if kind == Kind::Connect {
@@ -241,6 +236,7 @@ pub fn record_to_event(rec: &Record, now_ms: i64) -> Result<GuardEvent, Error> {
             comm = Some(base.to_owned());
         }
     }
+    let (args, args_truncated) = args_of(&v)?;
     Ok(GuardEvent {
         schema_version: SCHEMA_VERSION,
         kind,
@@ -251,8 +247,11 @@ pub fn record_to_event(rec: &Record, now_ms: i64) -> Result<GuardEvent, Error> {
         uid: opt_u32(&v, "uid")?,
         exe,
         comm,
-        args: args_of(&v)?,
+        comm_invalid,
+        args,
+        args_truncated,
         remote,
+        local: None,
         package: None,
         version: None,
         container_id: opt_string(&v, "container_id")?,
@@ -260,6 +259,7 @@ pub fn record_to_event(rec: &Record, now_ms: i64) -> Result<GuardEvent, Error> {
         runtime: None,
         severity: None,
         ancestors: Vec::new(),
+        source_rule_id: None,
     })
 }
 
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_rejects_port_zero_and_ipv6() {
+    fn connect_rejects_port_zero_and_accepts_ipv6() {
         let bad = Record {
             kind: KIND_CONNECT,
             observed_at_ms: 1,
@@ -315,9 +315,18 @@ mod tests {
         let v6 = Record {
             kind: KIND_CONNECT,
             observed_at_ms: 1,
-            payload: br#"{"pid":1,"remote":"::1"}"#.to_vec(),
+            payload: br#"{"pid":1,"remote":"[::1]:443"}"#.to_vec(),
         };
-        assert!(record_to_event(&v6, 1).is_err());
+        assert_eq!(
+            record_to_event(&v6, 1).unwrap().remote.as_deref(),
+            Some("[::1]:443")
+        );
+        let v6_zero = Record {
+            kind: KIND_CONNECT,
+            observed_at_ms: 1,
+            payload: br#"{"pid":1,"remote":"[::1]:0"}"#.to_vec(),
+        };
+        assert!(record_to_event(&v6_zero, 1).is_err());
         let ok = Record {
             kind: KIND_CONNECT,
             observed_at_ms: 1,
@@ -327,5 +336,18 @@ mod tests {
             record_to_event(&ok, 8).unwrap().remote.as_deref(),
             Some("192.0.2.10:443")
         );
+    }
+
+    #[test]
+    fn invalid_ring_comm_is_dropped_and_flagged() {
+        let rec = Record {
+            kind: KIND_EXEC,
+            observed_at_ms: 1,
+            payload: br#"{"pid":9,"exe":"/usr/lib/firefox/firefox","comm":"Web Content"}"#.to_vec(),
+        };
+        let ev = record_to_event(&rec, 2).unwrap();
+        assert!(ev.comm_invalid);
+        assert_eq!(ev.comm.as_deref(), Some("firefox"));
+        assert_eq!(ev.exe.as_deref(), Some("/usr/lib/firefox/firefox"));
     }
 }

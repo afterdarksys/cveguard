@@ -1,18 +1,23 @@
 //! Loopback HTTP for `/metrics`. The request is not copied into the response.
 //!
 //! Threats: binding a public address would publish decisions off the host.
-//! A huge header is rejected before it is parsed. Broken clients do not stop
-//! the accept loop; a ledger that cannot be read fails the process closed.
+//! A huge header is rejected before it is parsed. Each accepted stream has a
+//! 2 s read and write timeout, so an idle or slow client cannot hold the
+//! single-threaded loop and blind the scrape. Client and accept errors do not
+//! stop the loop; a ledger that cannot be read fails the process closed.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::time::Duration;
 
 use cveguard_proto::Error;
 
 use crate::snapshot::{self, Snapshot};
 
 const HEADER_LIMIT: usize = 2048;
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 enum HeaderRead {
     Ready(String),
@@ -43,16 +48,38 @@ pub fn parse_listen(text: &str) -> Result<SocketAddr, Error> {
 
 pub fn serve(addr: SocketAddr, ledger: &Path, gauges: Option<&Path>) -> Result<i32, Error> {
     let listener = TcpListener::bind(addr)?;
-    loop {
-        let (mut stream, _) = listener.accept()?;
-        let snapshot = snapshot::load_snapshot(ledger, gauges)?;
-        if let Err(err) = serve_one(&mut stream, &snapshot)
-            && err.kind() != io::ErrorKind::BrokenPipe
-            && err.kind() != io::ErrorKind::ConnectionReset
+    serve_listener(&listener, ledger, gauges, None)
+}
+
+/// Accept loop. `limit` stops after that many accepted connections (tests).
+pub fn serve_listener(
+    listener: &TcpListener,
+    ledger: &Path,
+    gauges: Option<&Path>,
+    limit: Option<u64>,
+) -> Result<i32, Error> {
+    let mut served = 0u64;
+    while limit.is_none_or(|max| served < max) {
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                std::thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
+        };
+        served = served.saturating_add(1);
+        if stream.set_read_timeout(Some(CLIENT_TIMEOUT)).is_err()
+            || stream.set_write_timeout(Some(CLIENT_TIMEOUT)).is_err()
         {
-            return Err(err.into());
+            continue;
+        }
+        let snapshot = snapshot::load_snapshot(ledger, gauges)?;
+        // A client that stalls, resets, or times out is dropped; the loop goes on.
+        if serve_one(&mut stream, &snapshot).is_err() {
+            continue;
         }
     }
+    Ok(0)
 }
 
 pub fn serve_one(stream: &mut TcpStream, snapshot: &Snapshot) -> io::Result<()> {
@@ -226,5 +253,32 @@ mod tests {
         let bad = exchange(b"GET /metrics HTTP/1.1\r\nX: \xff\r\n\r\n");
         assert!(bad.starts_with(b"HTTP/1.1 400 "));
         assert!(!bad.contains(&0xff));
+    }
+
+    #[test]
+    fn idle_client_does_not_block_a_scrape() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_listener(
+                &listener,
+                Path::new("/no/such/cveguard-ledger"),
+                None,
+                Some(2),
+            )
+        });
+        // First client connects and never sends a byte.
+        let _idle = TcpStream::connect(addr).unwrap();
+        let mut scraper = TcpStream::connect(addr).unwrap();
+        scraper
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        scraper
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut body = Vec::new();
+        scraper.read_to_end(&mut body).unwrap();
+        assert!(body.starts_with(b"HTTP/1.1 200 "));
+        assert_eq!(server.join().unwrap().unwrap(), 0);
     }
 }

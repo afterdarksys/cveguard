@@ -3,9 +3,14 @@
 //! Threats: an empty predicate would match every event. A rule cannot cite a
 //! malformed CVE. Imported events are marked so the engine can refuse to
 //! enforce them. Secret-looking arguments are dropped before anything is
-//! stored. The budget fails closed when the clock jumps backwards.
+//! stored. The budget fails closed when the clock jumps backwards. Argv shape
+//! never rejects an event: an attacker who pads argv past the cap, makes one
+//! argument huge, or embeds a newline would otherwise skip evaluation, so
+//! argv is cut to `MAX_ARGS` entries of `MAX_STRING` bytes, control
+//! characters are escaped, and `args_truncated` records the cut.
 
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +18,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, invalid, schema};
 use crate::fs::{self, FilePolicy};
 
+/// Event, finding, and seal manifest schema.
 pub const SCHEMA_VERSION: u16 = 1;
-pub const MAX_INTEL_BYTES: usize = 256 * 1024;
+/// Ledger row schema. Version 2 adds the `seq` / `prev` hash chain. Version 3
+/// adds `epoch`, `severity`, `source_rule_id`, and `args_truncated`.
+pub const DECISION_SCHEMA_VERSION: u16 = 3;
 pub const MAX_RULES: usize = 256;
 pub const MAX_EVENTS_PER_PASS: usize = 1000;
 pub const MAX_STRING: usize = 512;
@@ -72,6 +80,21 @@ pub enum Reason {
     Protected,
     PlanInvalid,
     Schema,
+    /// The tail lost an unread stretch of the feed (a rotation it could not
+    /// follow, or a shrink).
+    FeedGap,
+}
+
+/// Decision severity, in the nocved vocabulary darksignal reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,10 +136,19 @@ pub struct GuardEvent {
     pub exe: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comm: Option<String>,
+    /// The source carried a comm that failed `valid_subject`; it was dropped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub comm_invalid: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// argv was cut to `MAX_ARGS` entries or an entry to `MAX_STRING` bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub args_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Local `ip:port` of a socket (`[v6]:port` for IPv6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,16 +163,38 @@ pub struct GuardEvent {
     pub severity: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestors: Vec<String>,
+    /// The producer's own rule that raised this event: the highest-severity
+    /// nocved signal rule, or the aftercve finding `rule_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rule_id: Option<String>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One ledger row. `epoch`, `seq` and `prev` are filled by the ledger writer
+/// under its lock: `seq` starts at 1 and `prev` is the SHA-256 hex of the
+/// previous row's bytes (without the newline), or `chain::GENESIS` for the
+/// first row. `epoch` names the chain and stays the same across rotation.
+/// The JSON shape is the darksignal contract in DESIGN.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
     pub schema_version: u16,
+    /// Absent on schema 2 rows; never invented when an old row is re-read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub prev: String,
     pub observed_at_ms: i64,
     pub action: Action,
     pub outcome: Outcome,
     pub reason: Reason,
     pub origin: Origin,
+    #[serde(default)]
+    pub severity: Severity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,9 +202,15 @@ pub struct Decision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cve: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub comm_invalid: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub args_truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestors: Vec<String>,
 }
@@ -177,6 +237,9 @@ pub struct Rule {
     pub mode: Mode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cve: Option<String>,
+    /// Severity copied to the decision. Absent means medium.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
     pub when: Vec<Predicate>,
 }
 
@@ -245,6 +308,44 @@ pub fn valid_subject(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// The one comm normalizer for every source (nocved, aftercve, ring, guard
+/// JSON). Absent, null, or empty is no comm. A comm that is not a string or
+/// is not a `valid_subject` is dropped and reported as invalid; the caller
+/// keeps evaluating the event on `exe`. Comm text is never trusted for
+/// identity, so dropping it cannot widen what is protected.
+#[must_use]
+pub fn normalize_comm(raw: Option<&serde_json::Value>) -> (Option<String>, bool) {
+    match raw {
+        None | Some(serde_json::Value::Null) => (None, false),
+        Some(serde_json::Value::String(s)) if s.is_empty() => (None, false),
+        Some(serde_json::Value::String(s)) if valid_subject(s) => (Some(s.clone()), false),
+        Some(_) => (None, true),
+    }
+}
+
+/// Applies `normalize_comm` to an event that was deserialized directly.
+pub fn normalize_event_comm(ev: &mut GuardEvent) {
+    if ev
+        .comm
+        .as_deref()
+        .is_some_and(|c| !c.is_empty() && !valid_subject(c))
+    {
+        ev.comm = None;
+        ev.comm_invalid = true;
+    } else if ev.comm.as_deref() == Some("") {
+        ev.comm = None;
+    }
+}
+
+/// A producer rule id: 1..=128 bytes of `[A-Za-z0-9._-]` (darksignal's
+/// rule grammar).
+#[must_use]
+pub fn valid_rule_token(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 #[must_use]
 pub fn valid_cve(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("CVE-") else {
@@ -269,17 +370,49 @@ pub fn secret_arg(arg: &str) -> bool {
         || lower.starts_with("--token")
 }
 
-pub fn filter_args(args: Vec<String>) -> Result<Vec<String>, Error> {
-    let kept: Vec<String> = args.into_iter().filter(|a| !secret_arg(a)).collect();
-    if kept.len() > MAX_ARGS {
-        return Err(schema("too many args"));
-    }
-    for arg in &kept {
-        if arg.len() > MAX_STRING || arg.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r') {
-            return Err(schema("arg too long"));
+/// Drops secret-looking args, keeps the first `MAX_ARGS`, cuts each to
+/// `MAX_STRING` bytes at a char boundary, and escapes control characters.
+/// Never fails: argv shape must not let an event skip evaluation. The flag is
+/// true when an entry or a tail of entries was cut.
+#[must_use]
+pub fn filter_args(args: Vec<String>) -> (Vec<String>, bool) {
+    let mut truncated = false;
+    let mut kept = Vec::new();
+    for arg in args.into_iter().filter(|a| !secret_arg(a)) {
+        if kept.len() == MAX_ARGS {
+            truncated = true;
+            break;
         }
+        let (clean, cut) = clean_arg(&arg);
+        truncated |= cut;
+        kept.push(clean);
     }
-    Ok(kept)
+    (kept, truncated)
+}
+
+/// Escapes `\n`, `\r`, `\t` and other control characters (as `\u{..}`) and
+/// stops before `MAX_STRING` bytes, never splitting an escape or a char.
+fn clean_arg(arg: &str) -> (String, bool) {
+    let mut out = String::with_capacity(arg.len().min(MAX_STRING));
+    let mut buf = [0u8; 4];
+    for ch in arg.chars() {
+        let escaped;
+        let piece: &str = match ch {
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if c.is_control() => {
+                escaped = format!("\\u{{{:x}}}", u32::from(c));
+                &escaped
+            }
+            c => c.encode_utf8(&mut buf),
+        };
+        if out.len().saturating_add(piece.len()) > MAX_STRING {
+            return (out, true);
+        }
+        out.push_str(piece);
+    }
+    (out, false)
 }
 
 pub fn check_text(s: &str) -> Result<(), Error> {
@@ -329,33 +462,72 @@ pub fn validate_event(ev: &GuardEvent) -> Result<(), Error> {
             Some(remote) => check_remote(remote)?,
             None => return Err(schema("remote rejected")),
         }
+    } else if let Some(remote) = &ev.remote {
+        parse_endpoint(remote)?;
+    }
+    if let Some(local) = &ev.local {
+        parse_endpoint(local)?;
+    }
+    if let Some(rule) = &ev.source_rule_id
+        && !valid_rule_token(rule)
+    {
+        return Err(schema("source rule rejected"));
     }
     Ok(())
 }
 
+/// A connect peer: `ip`, `ip:port`, `[v6]`, or `[v6]:port`, port 1..=65535.
 pub fn check_remote(remote: &str) -> Result<(), Error> {
-    let (ip, port) = match remote.rsplit_once(':') {
-        Some((ip, port)) => {
-            if port.is_empty()
-                || (port.len() > 1 && port.starts_with('0'))
-                || !port.bytes().all(|b| b.is_ascii_digit())
-            {
-                return Err(schema("remote rejected"));
-            }
-            let value: u32 = port.parse().map_err(|_| schema("remote rejected"))?;
-            if value == 0 || value > 65535 {
-                return Err(schema("remote rejected"));
-            }
-            (ip, Some(value))
-        }
-        None => (remote, None),
+    match parse_endpoint(remote)? {
+        (_, Some(0)) => Err(schema("remote rejected")),
+        _ => Ok(()),
+    }
+}
+
+/// Parses `ip`, `ip:port`, `[v6]`, `[v6]:port`, or a bare IPv6 address.
+/// IPv4 uses the strict dotted quad (no leading zeros); IPv6 uses `std::net`.
+/// A port is decimal with no leading zero, 0..=65535.
+pub fn parse_endpoint(s: &str) -> Result<(IpAddr, Option<u16>), Error> {
+    let bad = || schema("remote rejected");
+    if let Some(rest) = s.strip_prefix('[') {
+        let (ip, tail) = rest.split_once(']').ok_or_else(bad)?;
+        let ip: Ipv6Addr = ip.parse().map_err(|_| bad())?;
+        let port = match tail {
+            "" => None,
+            _ => Some(parse_port(tail.strip_prefix(':').ok_or_else(bad)?)?),
+        };
+        return Ok((IpAddr::V6(ip), port));
+    }
+    if let Ok(ip) = s.parse::<Ipv6Addr>() {
+        return Ok((IpAddr::V6(ip), None));
+    }
+    let (ip, port) = match s.rsplit_once(':') {
+        Some((ip, port)) => (ip, Some(parse_port(port)?)),
+        None => (s, None),
     };
-    if ip.contains(':') {
+    let octets = crate::cidr::parse_ipv4(ip).map_err(|_| bad())?;
+    Ok((IpAddr::V4(Ipv4Addr::from(octets)), port))
+}
+
+pub fn parse_port(port: &str) -> Result<u16, Error> {
+    if port.is_empty()
+        || (port.len() > 1 && port.starts_with('0'))
+        || !port.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(schema("remote rejected"));
     }
-    crate::cidr::parse_ipv4(ip).map_err(|_| schema("remote rejected"))?;
-    let _ = port;
-    Ok(())
+    port.parse().map_err(|_| schema("remote rejected"))
+}
+
+/// Canonical text for an endpoint: `a.b.c.d[:port]` or `[v6][:port]`.
+#[must_use]
+pub fn format_endpoint(ip: IpAddr, port: Option<u16>) -> String {
+    match (ip, port) {
+        (IpAddr::V4(v4), Some(port)) => format!("{v4}:{port}"),
+        (IpAddr::V4(v4), None) => v4.to_string(),
+        (IpAddr::V6(v6), Some(port)) => format!("[{v6}]:{port}"),
+        (IpAddr::V6(v6), None) => format!("[{v6}]"),
+    }
 }
 
 pub fn load_rules(path: &Path) -> Result<Vec<Rule>, Error> {
@@ -514,14 +686,14 @@ mod tests {
 
     #[test]
     fn strips_secret_args_and_matches_basename_only_when_exe_present() {
-        let kept = filter_args(vec![
+        let (kept, truncated) = filter_args(vec![
             "--password=x".into(),
             "--donate-level=1".into(),
             "token=abc".into(),
             "--token".into(),
-        ])
-        .unwrap();
+        ]);
         assert_eq!(kept, vec!["--donate-level=1".to_owned()]);
+        assert!(!truncated);
         let ev = GuardEvent {
             schema_version: 1,
             kind: Kind::Exec,
@@ -532,8 +704,11 @@ mod tests {
             uid: None,
             exe: Some("/usr/bin/other".into()),
             comm: Some("xmrig".into()),
+            comm_invalid: false,
             args: Vec::new(),
+            args_truncated: false,
             remote: None,
+            local: None,
             package: None,
             version: None,
             container_id: None,
@@ -541,6 +716,7 @@ mod tests {
             runtime: None,
             severity: None,
             ancestors: Vec::new(),
+            source_rule_id: None,
         };
         let pred = Predicate::ExeBasename {
             equals: "xmrig".into(),
@@ -556,5 +732,52 @@ mod tests {
         assert!(!predicate_matches(&pred, &pkg, &[]));
         pkg.version = Some("1.2.3".into());
         assert!(predicate_matches(&pred, &pkg, &[]));
+    }
+
+    #[test]
+    fn argv_shape_never_rejects_and_marks_truncation() {
+        let many: Vec<String> = (0..70).map(|i| format!("a{i}")).collect();
+        let (kept, truncated) = filter_args(many);
+        assert_eq!(kept.len(), MAX_ARGS);
+        assert_eq!(kept[63], "a63");
+        assert!(truncated);
+
+        // 'é' is two bytes; the cut must land on a char boundary.
+        let long = format!("x{}", "é".repeat(400));
+        let (kept, truncated) = filter_args(vec![long]);
+        assert!(truncated);
+        assert!(kept[0].len() <= MAX_STRING);
+        assert!(kept[0].len() >= MAX_STRING - 1);
+        assert!(check_text(&kept[0]).is_ok());
+
+        let (kept, truncated) =
+            filter_args(vec!["echo a\nrm -rf /\r\tdone\u{0}\u{1b}[31m".to_owned()]);
+        assert!(!truncated);
+        assert_eq!(kept[0], "echo a\\nrm -rf /\\r\\tdone\\u{0}\\u{1b}[31m");
+        assert!(check_text(&kept[0]).is_ok());
+
+        // An escape that would cross the cap is dropped whole, not split.
+        let edge = format!("{}\n", "b".repeat(MAX_STRING - 1));
+        let (kept, truncated) = filter_args(vec![edge]);
+        assert!(truncated);
+        assert_eq!(kept[0], "b".repeat(MAX_STRING - 1));
+    }
+
+    #[test]
+    fn endpoints_accept_ipv6_and_reject_junk() {
+        assert!(check_remote("203.0.113.9:443").is_ok());
+        assert!(check_remote("[2001:db8::1]:443").is_ok());
+        assert!(check_remote("2001:db8::1").is_ok());
+        assert!(check_remote("203.0.113.9:0").is_err());
+        assert!(check_remote("[2001:db8::1]:0").is_err());
+        assert!(check_remote("203.0.113.9:08").is_err());
+        assert!(check_remote("203.0.113.9:65536").is_err());
+        assert!(check_remote("[2001:db8::1]443").is_err());
+        assert!(check_remote("010.0.0.1:80").is_err());
+        assert!(check_remote("example.com:80").is_err());
+        assert_eq!(
+            parse_endpoint("[::1]:9998").unwrap(),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), Some(9998))
+        );
     }
 }

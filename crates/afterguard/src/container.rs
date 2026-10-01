@@ -140,8 +140,11 @@ mod tests {
             uid: None,
             exe: None,
             comm: None,
+            comm_invalid: false,
             args: Vec::new(),
+            args_truncated: false,
             remote: None,
+            local: None,
             package: None,
             version: None,
             container_id: Some(id.to_owned()),
@@ -149,6 +152,7 @@ mod tests {
             runtime: None,
             severity: None,
             ancestors: Vec::new(),
+            source_rule_id: None,
         }
     }
 

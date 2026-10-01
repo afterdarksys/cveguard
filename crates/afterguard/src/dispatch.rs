@@ -14,11 +14,14 @@ use cveguard_proto::isolate;
 
 use crate::config::Loaded;
 use crate::run::{self, Runtime};
+use crate::ship::Shipper;
 
 #[cfg(test)]
 const GUARD_UNIT: &str = include_str!("../../../deploy/afterguard.service");
 #[cfg(test)]
 const ALERT_UNIT: &str = include_str!("../../../deploy/afteralert.service");
+#[cfg(test)]
+const SHIP_UNIT: &str = include_str!("../../../deploy/afterguard-ship.service");
 
 pub fn dispatch(args: &[String]) -> Result<i32, Error> {
     match args.first().map(String::as_str) {
@@ -45,6 +48,22 @@ pub fn dispatch(args: &[String]) -> Result<i32, Error> {
                     3 => return Ok(3),
                     _ => thread::sleep(Duration::from_secs(1)),
                 }
+            }
+        }
+        Some("ship") => {
+            let config = only(&flag_map(&args[1..])?, "--config")?;
+            let loaded = Loaded::load(Path::new(config))?;
+            let cfg = loaded
+                .ship
+                .clone()
+                .ok_or_else(|| Error::Invalid("ship not configured".to_owned()))?;
+            let mut shipper = Shipper::new(loaded.ledger.clone(), cfg)?;
+            loop {
+                let pass = shipper.pass(run::now_ms()?)?;
+                if pass.failed {
+                    eprintln!("afterguard: ship: darksignal socket unavailable, backing off");
+                }
+                thread::sleep(shipper.wait());
             }
         }
         Some("isolate") => isolate_cmd(&args[1..]),
@@ -257,13 +276,46 @@ mod tests {
     }
 
     #[test]
-    fn oversized_once_exits_without_ledger() {
+    fn oversized_once_line_is_a_rejected_row() {
         let fix = fixture("shadow", ALERT_RULES, &["192.0.2.10"], None);
         let huge = "a".repeat(9000);
-        let err = once(&fix, &huge).unwrap_err();
-        assert_eq!(err.to_string(), "line too long");
-        assert!(!err.to_string().contains("aaa"));
-        assert!(!fix.ledger.exists());
+        assert_eq!(once(&fix, &huge).unwrap(), 2);
+        let body = std::fs::read_to_string(&fix.ledger).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains("\"outcome\":\"rejected\""));
+        assert!(body.contains("\"reason\":\"schema\""));
+        assert!(!body.contains("aaa"));
+    }
+
+    #[test]
+    fn once_bad_line_does_not_abort_the_batch() {
+        let fix = fixture("shadow", ALERT_RULES, &["192.0.2.10"], None);
+        let body = format!(
+            "{XMRIG}{{not json\n{{\"kind\":\"audit.exec\",\"pid\":5,\"comm\":\"Web Content\",\"exe\":\"/tmp/xmrig\"}}\n"
+        );
+        assert_eq!(once(&fix, &body).unwrap(), 2);
+        let ledger = std::fs::read_to_string(&fix.ledger).unwrap();
+        let rows: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["rule_id"], "miner-exe");
+        assert_eq!(rows[1]["outcome"], "rejected");
+        assert_eq!(rows[1]["reason"], "schema");
+        assert_eq!(rows[2]["rule_id"], "miner-exe");
+        assert_eq!(rows[2]["comm_invalid"], true);
+        let seqs: Vec<u64> = rows.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn example_config_names_an_events_feed() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config.example.json");
+        let loaded = Loaded::load(&path).unwrap();
+        assert!(loaded.events.is_some());
+        assert!(loaded.ledger.starts_with("/var/lib/cveguard"));
     }
 
     #[test]
@@ -274,6 +326,25 @@ mod tests {
         assert!(GUARD_UNIT.contains("PrivateNetwork=yes"));
         assert!(GUARD_UNIT.contains("RestrictAddressFamilies=AF_UNIX"));
         assert!(GUARD_UNIT.contains("User=cveguard"));
+        for unit in [GUARD_UNIT, ALERT_UNIT] {
+            for line in [
+                "Restart=always",
+                "ProtectKernelTunables=yes",
+                "ProtectKernelModules=yes",
+                "ProtectKernelLogs=yes",
+                "ProtectControlGroups=yes",
+                "RestrictNamespaces=yes",
+                "LockPersonality=yes",
+                "MemoryDenyWriteExecute=yes",
+                "SystemCallFilter=@system-service",
+                "SystemCallArchitectures=native",
+                "NoNewPrivileges=yes",
+            ] {
+                assert!(unit.lines().any(|l| l == line), "{line}");
+            }
+        }
+        assert!(GUARD_UNIT.lines().any(|l| l == "StateDirectory=cveguard"));
+        assert!(GUARD_UNIT.lines().any(|l| l == "StateDirectoryMode=0700"));
         assert!(!GUARD_UNIT.contains("CAP_NET_ADMIN"));
         assert!(!GUARD_UNIT.contains("CAP_SYS_ADMIN"));
         assert!(!GUARD_UNIT.contains("CAP_SYS_PTRACE"));
@@ -281,6 +352,53 @@ mod tests {
         assert!(ALERT_UNIT.contains("IPAddressDeny=any"));
         assert!(ALERT_UNIT.contains("User=cveguard"));
         assert!(!ALERT_UNIT.contains("PrivateNetwork"));
+    }
+
+    #[test]
+    fn ship_unit_joins_the_producer_group_and_config_is_checked() {
+        for line in [
+            "User=cveguard",
+            "SupplementaryGroups=darksignal-producers",
+            "ExecStart=/usr/local/bin/afterguard ship --config /etc/cveguard/config.json",
+            "PrivateNetwork=yes",
+            "RestrictAddressFamilies=AF_UNIX",
+            "CapabilityBoundingSet=",
+            "NoNewPrivileges=yes",
+            "StateDirectory=cveguard",
+        ] {
+            assert!(SHIP_UNIT.lines().any(|l| l == line), "{line}");
+        }
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config.example.json");
+        let loaded = Loaded::load(&path).unwrap();
+        let ship = loaded.ship.unwrap();
+        assert!(ship.socket.is_absolute());
+        assert_eq!(ship.cursor, PathBuf::from("/var/lib/cveguard/ship.cursor"));
+
+        let fix = fixture("shadow", ALERT_RULES, &["192.0.2.10"], None);
+        let mut cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fix.config).unwrap()).unwrap();
+        for (socket, host) in [
+            ("relative.sock", "ns2"),
+            ("/run/d.sock", ".bad"),
+            ("/run/d.sock", ""),
+        ] {
+            cfg["ship"] = serde_json::json!({"socket": socket, "host": host});
+            std::fs::write(&fix.config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            assert!(Loaded::load(&fix.config).is_err(), "{socket} {host}");
+        }
+        cfg["ship"] = serde_json::json!({"socket": "/run/d.sock", "host": "ns2", "extra": 1});
+        std::fs::write(&fix.config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        assert!(Loaded::load(&fix.config).is_err());
+        // `ship` without a ship section is an error, not a silent no-op.
+        let plain = fixture("shadow", ALERT_RULES, &["192.0.2.10"], None);
+        let err = dispatch(&[
+            "ship".to_owned(),
+            "--config".to_owned(),
+            plain.config.to_str().unwrap().to_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("ship not configured"));
     }
 
     #[test]

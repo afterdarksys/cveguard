@@ -1,8 +1,24 @@
-//! nftables isolate *plan*. Nothing here runs nft.
+//! nftables isolate *plan*. Nothing here runs nft, conntrack, or systemd-run.
 //!
 //! Threats: a world route, a prefix wider than /16, or an implicit RFC1918
 //! allow would either lock the operator out or leave the fleet routable.
 //! Management addresses are mandatory. The debut build refuses to apply a plan.
+//!
+//! The plan is a shell recipe in a fixed order:
+//! 1. Arm the deadman: a transient systemd timer that deletes the table after
+//!    `deadman_secs`. It runs first, so a ruleset that locks the operator out
+//!    still rolls back. `set -eu` stops the recipe if arming fails.
+//! 2. Load the table. Input accepts only loopback and packets whose *source*
+//!    is in the allow set; output accepts only loopback and packets whose
+//!    *destination* is in the allow set. Established traffic is not
+//!    blanket-accepted, so a C2 session that predates isolation is dropped.
+//!    The host's own address being in `local_cidrs` therefore opens nothing.
+//! 3. Flush conntrack so no pre-isolation flow keeps state. Flows to allowed
+//!    peers are re-tracked as new and re-accepted by the allow rules; flows to
+//!    any other peer are dropped by policy.
+//!
+//! Not covered: IPv6 has no allow set, so every non-loopback IPv6 packet is
+//! dropped. A rooted host can delete the table or the timer.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +85,13 @@ pub fn plan(spec: &IsolateSpec) -> Result<String, Error> {
     let revert = deactivate_recipe();
     Ok(format!(
         "\
+#!/bin/sh
+# cveguard isolate plan. Printed by cveguard, never run by it.
+set -eu
+# step 1: deadman. Scheduled rollback removes the table after {deadman}s.
+systemd-run --unit=cveguard-deadman --on-active={deadman}s {revert}
+# step 2: ruleset.
+nft -f - <<'CVEGUARD_NFT'
 table inet cveguard {{
 \tset allow4 {{
 \t\ttype ipv4_addr
@@ -78,20 +101,19 @@ table inet cveguard {{
 \tchain input {{
 \t\ttype filter hook input priority 0; policy drop;
 \t\tiif \"lo\" accept
-\t\tct state established,related accept
-\t\tip saddr @allow4 accept
-\t\tip daddr @allow4 accept
+\t\tip saddr @allow4 ct state established,related,new accept
 \t}}
 \tchain output {{
 \t\ttype filter hook output priority 0; policy drop;
 \t\toif \"lo\" accept
-\t\tct state established,related accept
-\t\tip daddr @allow4 accept
-\t\tip saddr @allow4 accept
+\t\tip daddr @allow4 ct state established,related,new accept
 \t}}
 }}
-# deadman_secs {deadman}
-# revert: {revert}
+CVEGUARD_NFT
+# step 3: drop tracked flows; allow-set peers re-match as new, others drop.
+conntrack -F
+# keep isolation past the deadman: systemctl stop cveguard-deadman.timer
+# revert now: {revert}
 ",
         deadman = spec.deadman_secs,
     ))
@@ -152,6 +174,72 @@ mod tests {
         assert!(plan(&spec).is_err());
         spec.deadman_secs = 901;
         assert!(plan(&spec).is_err());
+    }
+
+    fn chain<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+        let head = format!("chain {name} {{");
+        text.lines()
+            .skip_while(|l| l.trim() != head)
+            .skip(1)
+            .take_while(|l| l.trim() != "}")
+            .map(str::trim)
+            .collect()
+    }
+
+    fn commands(text: &str) -> Vec<&str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    #[test]
+    fn plan_filters_by_peer_direction() {
+        let text = plan(&sample()).unwrap();
+        let input = chain(&text, "input");
+        let output = chain(&text, "output");
+        assert!(!input.is_empty() && !output.is_empty());
+        assert!(input.iter().all(|l| !l.contains("ip daddr @allow4")));
+        assert!(output.iter().all(|l| !l.contains("ip saddr @allow4")));
+        assert!(input.contains(&"ip saddr @allow4 ct state established,related,new accept"));
+        assert!(output.contains(&"ip daddr @allow4 ct state established,related,new accept"));
+        assert!(input.contains(&"iif \"lo\" accept"));
+        assert!(output.contains(&"oif \"lo\" accept"));
+    }
+
+    #[test]
+    fn established_is_not_blanket_accepted() {
+        let text = plan(&sample()).unwrap();
+        for line in text.lines().filter(|l| l.contains("ct state")) {
+            assert!(line.contains("@allow4"), "{line}");
+        }
+        for name in ["input", "output"] {
+            for line in chain(&text, name) {
+                let is_lo = line == "iif \"lo\" accept" || line == "oif \"lo\" accept";
+                assert!(
+                    is_lo || line.contains("@allow4") || line.starts_with("type filter"),
+                    "{line}"
+                );
+            }
+        }
+        let cmds = commands(&text);
+        assert!(cmds.contains(&"conntrack -F"));
+    }
+
+    #[test]
+    fn deadman_is_a_real_first_step() {
+        let text = plan(&sample()).unwrap();
+        let cmds = commands(&text);
+        let deadman = cmds
+            .iter()
+            .position(|l| {
+                *l == "systemd-run --unit=cveguard-deadman --on-active=120s nft delete table inet cveguard"
+            })
+            .unwrap();
+        let load = cmds.iter().position(|l| l.starts_with("nft -f -")).unwrap();
+        let flush = cmds.iter().position(|l| *l == "conntrack -F").unwrap();
+        assert!(deadman < load && load < flush);
+        assert!(cmds.contains(&"set -eu"));
     }
 
     #[test]

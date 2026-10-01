@@ -3,6 +3,11 @@
 //! Threats: enforce mode with a missing seal or a plan that cannot be rendered
 //! must not record ordinary decisions. A seal mismatch writes one alert and
 //! stops the pass. Imported lines stay non-ring because ingest forces that.
+//! The seal is re-verified every `seal_recheck_passes` passes (default 60),
+//! so a binary replaced after startup is caught. A full ledger rotates and
+//! never stops the daemon. A feed gap (a shrink, or a rotation the tail
+//! could not follow) is a `record` / `rejected` / `feed_gap` row and the
+//! `events_gap` counter in `status.json`.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,35 +15,44 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cveguard_proto::Error;
 use cveguard_proto::fs::{self, FilePolicy};
 use cveguard_proto::intel::ingest_line;
-use cveguard_proto::model::{GuardEvent, MAX_EVENTS_PER_PASS, MAX_LINE, Mode, Outcome};
+use cveguard_proto::model::{Decision, GuardEvent, MAX_EVENTS_PER_PASS, MAX_LINE, Mode, Outcome};
 use cveguard_proto::ring::{self, Record, SharedRing};
 use cveguard_proto::seal::SealStatus;
 use serde::Serialize;
 
-use crate::config::Loaded;
+use crate::config::{Loaded, seal_check_at};
 use crate::engine::Engine;
-use crate::ledger;
+use crate::ledger::Ledger;
 use crate::tail::Tail;
 
 pub struct Runtime {
     engine: Engine,
     ring: SharedRing,
     tail: Tail,
-    ledger: std::path::PathBuf,
-    ledger_max: usize,
+    ledger: Ledger,
     events: Option<std::path::PathBuf>,
     status: Option<std::path::PathBuf>,
+    seal: Option<std::path::PathBuf>,
+    seal_recheck_passes: u32,
+    passes: u64,
     bad_lines: u64,
     rules_loaded: u64,
 }
 
 #[derive(Serialize)]
-struct StatusFile {
+struct StatusFile<'a> {
     rules_loaded: u64,
     enforce_enabled: u64,
     ring_lost: u64,
     tamper_mismatch: u64,
     bad_lines: u64,
+    ledger_seq: u64,
+    ledger_head: &'a str,
+    ledger_drops: u64,
+    ledger_rotations: u64,
+    ledger_epoch: u64,
+    events_replaced: u64,
+    events_gap: u64,
 }
 
 impl Runtime {
@@ -47,7 +61,7 @@ impl Runtime {
             return Err(Error::Invalid("daemon disabled".to_owned()));
         }
         let rules_loaded = u64::try_from(loaded.rules.len()).unwrap_or(u64::MAX);
-        let seal = loaded.seal_status();
+        let seal = loaded.seal_check();
         let mut ring = SharedRing::new(loaded.ring_cap)?;
         ring.attach()?;
         let engine = Engine::new(
@@ -61,10 +75,12 @@ impl Runtime {
             engine,
             ring,
             tail: Tail::new(),
-            ledger: loaded.ledger,
-            ledger_max: loaded.ledger_max,
+            ledger: Ledger::new(loaded.ledger, loaded.ledger_max)?,
             events: loaded.events,
             status: loaded.status,
+            seal: loaded.seal,
+            seal_recheck_passes: loaded.seal_recheck_passes,
+            passes: 0,
             bad_lines: 0,
             rules_loaded,
         })
@@ -93,6 +109,13 @@ impl Runtime {
     }
 
     pub fn run_at(&mut self, now_ms: i64) -> Result<i32, Error> {
+        self.passes = self.passes.saturating_add(1);
+        if self
+            .passes
+            .is_multiple_of(u64::from(self.seal_recheck_passes))
+        {
+            self.engine.update_seal(seal_check_at(self.seal.as_deref()));
+        }
         if let Some(code) = self.gate()? {
             return Ok(code);
         }
@@ -100,6 +123,11 @@ impl Runtime {
         if let Some(path) = self.events.clone() {
             let batch = self.tail.poll(&path, now_ms, MAX_EVENTS_PER_PASS)?;
             self.bad_lines = self.bad_lines.saturating_add(batch.bad_lines);
+            for _ in 0..batch.gaps {
+                if let Some(row) = self.engine.feed_gap(now_ms) {
+                    rejected |= self.record(&row)?;
+                }
+            }
             for event in batch.events {
                 if self.note(event)? {
                     rejected = true;
@@ -122,12 +150,14 @@ impl Runtime {
 
     fn gate(&mut self) -> Result<Option<i32>, Error> {
         if let Some(alert) = self.engine.take_seal_alert() {
-            ledger::append_decision(&self.ledger, &alert, self.ledger_max)?;
+            self.ledger.append(&alert)?;
             self.write_status()?;
             return Ok(Some(3));
         }
-        let blocked = self.engine.mode() == Mode::Enforce
-            && (self.engine.seal_status() != SealStatus::Valid || !self.engine.isolate_plan_ok());
+        let blocked = self.engine.halted()
+            || self.engine.mode() == Mode::Enforce
+                && (self.engine.seal_status() != SealStatus::Valid
+                    || !self.engine.isolate_plan_ok());
         if blocked {
             self.write_status()?;
             return Ok(Some(3));
@@ -139,21 +169,32 @@ impl Runtime {
         let Some(decision) = self.engine.evaluate(&event) else {
             return Ok(false);
         };
-        let rejected = decision.outcome == Outcome::Rejected;
-        ledger::append_decision(&self.ledger, &decision, self.ledger_max)?;
-        Ok(rejected)
+        self.record(&decision)
+    }
+
+    fn record(&mut self, decision: &Decision) -> Result<bool, Error> {
+        self.ledger.append(decision)?;
+        Ok(decision.outcome == Outcome::Rejected)
     }
 
     fn write_status(&self) -> Result<(), Error> {
         let Some(path) = &self.status else {
             return Ok(());
         };
+        let stats = self.ledger.stats();
         let body = StatusFile {
             rules_loaded: self.rules_loaded,
             enforce_enabled: u64::from(self.engine.mode() == Mode::Enforce),
             ring_lost: self.ring.lost(),
             tamper_mismatch: u64::from(self.engine.seal_status() == SealStatus::Mismatch),
             bad_lines: self.bad_lines,
+            ledger_seq: stats.head.seq,
+            ledger_head: &stats.head.head,
+            ledger_drops: stats.drops,
+            ledger_rotations: stats.rotations,
+            ledger_epoch: stats.head.epoch,
+            events_replaced: self.tail.replaced(),
+            events_gap: self.tail.gaps(),
         };
         let bytes =
             serde_json::to_vec(&body).map_err(|_| Error::Schema("json rejected".to_owned()))?;
@@ -201,59 +242,63 @@ fn seal_word(seal: SealStatus) -> &'static str {
     }
 }
 
+/// Bad lines become `rejected` / `schema` rows; the rest of the batch is
+/// still evaluated. Exit 2 when any row was rejected.
 pub fn once(loaded: Loaded, input: &Path) -> Result<i32, Error> {
     let mut runtime = Runtime::new(loaded)?;
     if let Some(code) = runtime.gate()? {
         return Ok(code);
     }
-    let events = parse_once(input)?;
+    let lines = parse_once(input)?;
     let now = now_ms()?;
     let mut rejected = false;
-    for mut event in events {
-        if event.observed_at_ms == 0 {
-            event.observed_at_ms = now;
-        }
-        if runtime.note(event)? {
-            rejected = true;
-        }
+    for line in lines {
+        let hit = match line {
+            Some(mut event) => {
+                if event.observed_at_ms == 0 {
+                    event.observed_at_ms = now;
+                }
+                runtime.note(event)?
+            }
+            None => match runtime.engine.reject_line(now) {
+                Some(decision) => runtime.record(&decision)?,
+                None => false,
+            },
+        };
+        rejected |= hit;
     }
     runtime.write_status()?;
     if rejected { Ok(2) } else { Ok(0) }
 }
 
-fn parse_once(path: &Path) -> Result<Vec<GuardEvent>, Error> {
+/// One entry per non-empty line: `Some(event)`, or `None` for a line that
+/// failed to parse. Skipped kinds produce nothing.
+fn parse_once(path: &Path) -> Result<Vec<Option<GuardEvent>>, Error> {
     let bytes = fs::read_trusted(path, 1024 * 1024, FilePolicy::Config)?;
-    let mut events = Vec::new();
-    let mut start = 0usize;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'\n' {
+    let mut out = Vec::new();
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        push_line(&mut events, &bytes[start..index])?;
-        start = index + 1;
+        out.push(parse_line(line));
+        if out.len() > MAX_EVENTS_PER_PASS {
+            return Err(Error::Invalid("too many events".to_owned()));
+        }
     }
-    if start < bytes.len() {
-        push_line(&mut events, &bytes[start..])?;
-    }
-    if events.len() > MAX_EVENTS_PER_PASS {
-        return Err(Error::Invalid("too many events".to_owned()));
-    }
-    Ok(events)
+    Ok(out.into_iter().flatten().collect())
 }
 
-fn push_line(events: &mut Vec<GuardEvent>, line: &[u8]) -> Result<(), Error> {
+fn parse_line(line: &[u8]) -> Option<Option<GuardEvent>> {
     if line.len() > MAX_LINE {
-        return Err(Error::Invalid("line too long".to_owned()));
+        return Some(None);
     }
-    let text = std::str::from_utf8(line).map_err(|_| Error::Schema("json rejected".to_owned()))?;
+    let Ok(text) = std::str::from_utf8(line) else {
+        return Some(None);
+    };
     match ingest_line(text) {
-        Ok(Some(event)) => {
-            events.push(event);
-            Ok(())
-        }
-        Ok(None) => Ok(()),
-        Err(Error::Schema(_)) => Err(Error::Schema("json rejected".to_owned())),
-        Err(err) => Err(err),
+        Ok(Some(event)) => Some(Some(event)),
+        Ok(None) => None,
+        Err(_) => Some(None),
     }
 }
 
@@ -350,10 +395,143 @@ mod tests {
     }
 
     #[test]
+    fn double_rotation_writes_a_feed_gap_row_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let line = |pid: u32| {
+            format!("{{\"schema_version\":1,\"kind\":\"exec\",\"pid\":{pid},\"exe\":\"/bin/w\"}}\n")
+        };
+        std::fs::write(&events, line(1)).unwrap();
+        let loaded = shadow_loaded(
+            dir.path(),
+            serde_json::json!({"events": "events.jsonl", "status": "status.json"}),
+        );
+        let mut runtime = Runtime::new(loaded).unwrap();
+        assert_eq!(runtime.run_at(9).unwrap(), 0);
+        let rotated = dir.path().join("events.jsonl.1");
+        for pid in [2, 3] {
+            std::fs::rename(&events, &rotated).unwrap();
+            let staged = dir.path().join("fresh");
+            std::fs::write(&staged, line(pid)).unwrap();
+            std::fs::rename(&staged, &events).unwrap();
+        }
+        assert_eq!(runtime.run_at(10).unwrap(), 2);
+        let body = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["action"], "record");
+        assert_eq!(rows[0]["outcome"], "rejected");
+        assert_eq!(rows[0]["reason"], "feed_gap");
+        assert_eq!(rows[0]["severity"], "high");
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["events_gap"], 1);
+        assert_eq!(status["events_replaced"], 1);
+        assert_eq!(status["ledger_epoch"], rows[0]["epoch"]);
+    }
+
+    #[test]
     fn zero_passes_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let loaded = shadow_loaded(dir.path(), serde_json::json!({}));
         let mut runtime = Runtime::new(loaded).unwrap();
         assert!(runtime.run_passes(0).is_err());
+    }
+
+    fn exec_record(pid: u32) -> Record {
+        Record {
+            kind: KIND_EXEC,
+            observed_at_ms: 1,
+            payload: format!(r#"{{"pid":{pid},"exe":"/tmp/xmrig","comm":"xmrig"}}"#).into_bytes(),
+        }
+    }
+
+    #[test]
+    fn full_ledger_keeps_running_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = shadow_loaded(
+            dir.path(),
+            serde_json::json!({"ledger_max": 1024, "status": "status.json"}),
+        );
+        let mut runtime = Runtime::new(loaded).unwrap();
+        for pass in 0..20u32 {
+            runtime.push_ring(exec_record(pass + 2)).unwrap();
+            assert_eq!(runtime.run_at(100 + i64::from(pass)).unwrap(), 0);
+        }
+        let ledger = dir.path().join("decisions.jsonl");
+        let old = std::fs::read(dir.path().join("decisions.jsonl.1")).unwrap();
+        let cur = std::fs::read(&ledger).unwrap();
+        assert!(cur.len() <= 1024);
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("status.json")).unwrap())
+                .unwrap();
+        assert!(status["ledger_rotations"].as_u64().unwrap() >= 1);
+        assert_eq!(status["ledger_seq"], 20);
+        assert_eq!(status["ledger_drops"], 0);
+        let head = cveguard_proto::chain::ChainHead {
+            epoch: 0,
+            seq: 20,
+            head: status["ledger_head"].as_str().unwrap().to_owned(),
+        };
+        assert!(cveguard_proto::chain::verify(Some(&old), &cur, Some(&head)));
+    }
+
+    fn seal_dir(dir: &Path) -> Vec<std::path::PathBuf> {
+        let root = std::fs::canonicalize(dir).unwrap();
+        let tools = root.join("bin");
+        std::fs::create_dir(&tools).unwrap();
+        let mut paths = Vec::new();
+        for name in cveguard_proto::seal::CENSUS {
+            let path = tools.join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            paths.push(path);
+        }
+        let manifest = cveguard_proto::seal::pin(&paths).unwrap();
+        cveguard_proto::seal::write_manifest(&root.join("seal.json"), &manifest).unwrap();
+        paths
+    }
+
+    #[test]
+    fn seal_is_rechecked_every_n_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = seal_dir(dir.path());
+        let loaded = shadow_loaded(
+            dir.path(),
+            serde_json::json!({"seal": "seal.json", "seal_recheck_passes": 3}),
+        );
+        let mut runtime = Runtime::new(loaded).unwrap();
+        assert_eq!(runtime.engine.seal_status(), SealStatus::Valid);
+        assert_eq!(runtime.run_at(1).unwrap(), 0);
+        std::fs::write(&tools[3], b"replaced afterguard").unwrap();
+        assert_eq!(runtime.run_at(2).unwrap(), 0);
+        assert_eq!(runtime.run_at(3).unwrap(), 3);
+        assert_eq!(runtime.engine.seal_status(), SealStatus::Mismatch);
+        let body = std::fs::read_to_string(dir.path().join("decisions.jsonl")).unwrap();
+        assert!(body.contains("seal_mismatch"));
+        assert_eq!(runtime.run_at(4).unwrap(), 3);
+    }
+
+    #[test]
+    fn seal_recheck_passes_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rules.json"), RULES).unwrap();
+        let cfg = serde_json::json!({
+            "mode": "shadow", "enabled": true, "rules": "rules.json",
+            "seal_recheck_passes": 0,
+            "isolate": {"management_ips": ["192.0.2.10"], "deadman_secs": 120}
+        });
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        assert!(
+            Loaded::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("seal recheck")
+        );
     }
 }

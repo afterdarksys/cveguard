@@ -1,12 +1,17 @@
 [Unit]
-Description=cveguard decision daemon
-After=network.target
+Description=cveguard ledger shipper to the local darksignal socket
+After=afterguard.service darksignal.service
 
 [Service]
 Type=simple
 User=cveguard
 Group=cveguard
-ExecStart=/usr/local/bin/afterguard run --config /etc/cveguard/config.json
+# darksignal (run as root with socket_gid set) keeps its socket 0660 in a
+# 0750 directory owned by group darksignal-producers. cveguard joins that
+# group to connect; darksignal still checks the peer uid and that the exe is
+# /usr/local/bin/afterguard.
+SupplementaryGroups=darksignal-producers
+ExecStart=/usr/local/bin/afterguard ship --config /etc/cveguard/config.json
 Restart=always
 RestartSec=5
 CapabilityBoundingSet=

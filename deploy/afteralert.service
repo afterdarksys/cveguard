@@ -7,13 +7,27 @@ Type=simple
 User=cveguard
 Group=cveguard
 ExecStart=/usr/local/bin/afteralert serve --listen 127.0.0.1:8752 --ledger /var/lib/cveguard/decisions.jsonl --gauges /var/lib/cveguard/status.json
+Restart=always
+RestartSec=5
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 IPAddressAllow=localhost
 IPAddressDeny=any
+RestrictAddressFamilies=AF_INET AF_UNIX
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -10,20 +10,33 @@ use cveguard_proto::Error;
 use cveguard_proto::fs::{self, FilePolicy};
 use cveguard_proto::isolate::IsolateSpec;
 use cveguard_proto::model::{ActionBudget, Mode, Rule, load_rules};
-use cveguard_proto::seal::{self, SealStatus};
+use cveguard_proto::seal::{self, SealCheck, SealStatus};
 use serde::Deserialize;
+
+use crate::ship::{ShipConfig, valid_host};
 
 const CONFIG_MAX: usize = 64 * 1024;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 const DEFAULT_MAX_ACTIONS: u32 = 10;
 const DEFAULT_RING_CAP: usize = 256;
 const DEFAULT_LEDGER_MAX: u64 = 1024 * 1024;
+const DEFAULT_SEAL_RECHECK_PASSES: u32 = 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBudget {
     window_ms: u64,
     max_actions: u32,
+}
+
+/// `afterguard ship`: where darksignal listens and what host it expects.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShip {
+    socket: String,
+    host: String,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +62,10 @@ struct RawConfig {
     ledger_max: Option<u64>,
     #[serde(default)]
     budget: Option<RawBudget>,
+    #[serde(default)]
+    seal_recheck_passes: Option<u32>,
+    #[serde(default)]
+    ship: Option<RawShip>,
 }
 
 #[derive(Debug)]
@@ -64,6 +81,8 @@ pub struct Loaded {
     pub(crate) ring_cap: usize,
     pub(crate) ledger_max: usize,
     pub(crate) budget: ActionBudget,
+    pub(crate) seal_recheck_passes: u32,
+    pub(crate) ship: Option<ShipConfig>,
 }
 
 impl Loaded {
@@ -92,6 +111,12 @@ impl Loaded {
         if !(64..=DEFAULT_LEDGER_MAX).contains(&ledger_max_u) {
             return Err(Error::Invalid("ledger max rejected".to_owned()));
         }
+        let seal_recheck_passes = raw
+            .seal_recheck_passes
+            .unwrap_or(DEFAULT_SEAL_RECHECK_PASSES);
+        if !(1..=86_400).contains(&seal_recheck_passes) {
+            return Err(Error::Invalid("seal recheck rejected".to_owned()));
+        }
         let ledger_max = usize::try_from(ledger_max_u)
             .map_err(|_| Error::Invalid("ledger max rejected".to_owned()))?;
         let dir = match path.parent() {
@@ -103,6 +128,10 @@ impl Loaded {
             Some(value) => resolve(dir, value),
             None => dir.join("decisions.jsonl"),
         };
+        let ship = raw
+            .ship
+            .map(|ship| ship_config(dir, &ledger, ship))
+            .transpose()?;
         Ok(Self {
             mode: raw.mode,
             enabled: raw.enabled,
@@ -115,15 +144,51 @@ impl Loaded {
             ring_cap,
             ledger_max,
             budget,
+            seal_recheck_passes,
+            ship,
         })
     }
 
     #[must_use]
+    pub fn seal_check(&self) -> SealCheck {
+        seal_check_at(self.seal.as_deref())
+    }
+
+    #[must_use]
     pub fn seal_status(&self) -> SealStatus {
-        match &self.seal {
-            Some(path) => seal::verify(path),
-            None => SealStatus::Missing,
-        }
+        self.seal_check().status
+    }
+}
+
+/// The socket must be absolute; the host must pass darksignal's grammar.
+/// The cursor defaults to `ship.cursor` beside the ledger.
+fn ship_config(dir: &Path, ledger: &Path, raw: RawShip) -> Result<ShipConfig, Error> {
+    let socket = PathBuf::from(&raw.socket);
+    if !socket.is_absolute() {
+        return Err(Error::Invalid("ship socket rejected".to_owned()));
+    }
+    if !valid_host(&raw.host) {
+        return Err(Error::Invalid("ship host rejected".to_owned()));
+    }
+    let cursor = match &raw.cursor {
+        Some(value) => resolve(dir, value),
+        None => ledger
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("ship.cursor"),
+    };
+    Ok(ShipConfig {
+        socket,
+        host: raw.host,
+        cursor,
+    })
+}
+
+#[must_use]
+pub fn seal_check_at(path: Option<&Path>) -> SealCheck {
+    match path {
+        Some(path) => seal::check(path),
+        None => SealCheck::of(SealStatus::Missing),
     }
 }
 
@@ -191,5 +256,6 @@ mod tests {
         assert_eq!(loaded.rules.len(), 1);
         assert_eq!(loaded.seal_status(), SealStatus::Missing);
         assert!(loaded.budget.is_empty());
+        assert_eq!(loaded.seal_recheck_passes, 60);
     }
 }
