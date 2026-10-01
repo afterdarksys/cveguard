@@ -1,0 +1,19 @@
+[Unit]
+Description=cveguard prometheus exporter
+After=afterguard.service
+
+[Service]
+Type=simple
+User=cveguard
+Group=cveguard
+ExecStart=/usr/local/bin/afteralert serve --listen 127.0.0.1:8752 --ledger /var/lib/cveguard/decisions.jsonl --gauges /var/lib/cveguard/status.json
+NoNewPrivileges=yes
+IPAddressAllow=localhost
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

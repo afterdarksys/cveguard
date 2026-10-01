@@ -1,0 +1,14 @@
+{
+  "mode": "shadow",
+  "enabled": true,
+  "rules": "rules.example.json",
+  "isolate": {
+    "local_cidrs": ["10.1.2.0/24"],
+    "whitelist": ["192.0.2.20/32"],
+    "management_ips": ["192.0.2.10"],
+    "store_ips": ["198.51.100.8"],
+    "keep_store": true,
+    "deadman_secs": 120
+  },
+  "capabilities": []
+}

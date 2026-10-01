@@ -1,0 +1,22 @@
+# Cargo build output. Cargo.lock stays tracked: these are binaries.
+target/
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug info and cargo-mutants output
+*.pdb
+mutants.out/
+
+# local databases
+*.db
+*.db-wal
+*.db-shm
+
+# editor and OS
+.DS_Store
+*.swp
+*~
+
+# agent runtime state
+.omc/

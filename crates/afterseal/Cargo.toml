@@ -1,0 +1,17 @@
+[package]
+name = "afterseal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Toolchain SHA-256 pin and census for cveguard"
+
+[dependencies]
+cveguard-proto.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

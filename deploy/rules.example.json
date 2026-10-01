@@ -1,0 +1,24 @@
+[
+  {
+    "id": "miner-exe",
+    "enabled": true,
+    "action": "alert",
+    "mode": "enforce",
+    "when": [{ "op": "exe_basename", "equals": "xmrig" }]
+  },
+  {
+    "id": "example-miner-cve",
+    "enabled": true,
+    "action": "alert",
+    "mode": "enforce",
+    "cve": "CVE-2099-0001",
+    "when": [{ "op": "package_exact", "name": "example-miner", "version": "1.2.3" }]
+  },
+  {
+    "id": "isolate-miner",
+    "enabled": true,
+    "action": "isolate",
+    "mode": "shadow",
+    "when": [{ "op": "exe_basename", "equals": "xmrig" }]
+  }
+]

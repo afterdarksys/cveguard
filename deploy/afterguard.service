@@ -1,0 +1,22 @@
+[Unit]
+Description=cveguard decision daemon
+After=network.target
+
+[Service]
+Type=simple
+User=cveguard
+Group=cveguard
+ExecStart=/usr/local/bin/afterguard run --config /etc/cveguard/config.json
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+ReadWritePaths=/var/lib/cveguard
+
+[Install]
+WantedBy=multi-user.target
