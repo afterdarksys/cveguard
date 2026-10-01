@@ -37,6 +37,9 @@ pub struct Runtime {
     passes: u64,
     bad_lines: u64,
     rules_loaded: u64,
+    stop: Option<&'static str>,
+    written: u64,
+    rejected_rows: u64,
 }
 
 #[derive(Serialize)]
@@ -83,6 +86,9 @@ impl Runtime {
             passes: 0,
             bad_lines: 0,
             rules_loaded,
+            stop: None,
+            written: 0,
+            rejected_rows: 0,
         })
     }
 
@@ -148,17 +154,34 @@ impl Runtime {
         if rejected { Ok(2) } else { Ok(0) }
     }
 
+    /// Why the last pass returned 3: `seal_mismatch`, `halted`,
+    /// `enforce_seal_not_valid`, or `enforce_plan_invalid`.
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<&'static str> {
+        self.stop
+    }
+
     fn gate(&mut self) -> Result<Option<i32>, Error> {
         if let Some(alert) = self.engine.take_seal_alert() {
             self.ledger.append(&alert)?;
+            self.written = self.written.saturating_add(1);
+            self.stop = Some("seal_mismatch");
             self.write_status()?;
             return Ok(Some(3));
         }
-        let blocked = self.engine.halted()
-            || self.engine.mode() == Mode::Enforce
-                && (self.engine.seal_status() != SealStatus::Valid
-                    || !self.engine.isolate_plan_ok());
-        if blocked {
+        let reason = if self.engine.halted() {
+            Some("halted")
+        } else if self.engine.mode() == Mode::Enforce
+            && self.engine.seal_status() != SealStatus::Valid
+        {
+            Some("enforce_seal_not_valid")
+        } else if self.engine.mode() == Mode::Enforce && !self.engine.isolate_plan_ok() {
+            Some("enforce_plan_invalid")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.stop = Some(reason);
             self.write_status()?;
             return Ok(Some(3));
         }
@@ -174,7 +197,12 @@ impl Runtime {
 
     fn record(&mut self, decision: &Decision) -> Result<bool, Error> {
         self.ledger.append(decision)?;
-        Ok(decision.outcome == Outcome::Rejected)
+        self.written = self.written.saturating_add(1);
+        let rejected = decision.outcome == Outcome::Rejected;
+        if rejected {
+            self.rejected_rows = self.rejected_rows.saturating_add(1);
+        }
+        Ok(rejected)
     }
 
     fn write_status(&self) -> Result<(), Error> {
@@ -196,34 +224,64 @@ impl Runtime {
             events_replaced: self.tail.replaced(),
             events_gap: self.tail.gaps(),
         };
-        let bytes =
-            serde_json::to_vec(&body).map_err(|_| Error::Schema("json rejected".to_owned()))?;
-        fs::write_atomic_0600(path, &bytes)
+        let mut payload =
+            serde_json::to_value(&body).map_err(|_| Error::Schema("json rejected".to_owned()))?;
+        payload["daemon"] = serde_json::Value::from("run");
+        if let Some(stop) = self.stop {
+            payload["stop_reason"] = serde_json::Value::from(stop);
+        }
+        crate::status::write(path, payload, now_ms()?)
     }
 }
 
-pub fn check(loaded: &Loaded) -> Result<i32, Error> {
+/// What `once` did. `stopped` is the gate reason when it exited 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OnceSummary {
+    #[serde(skip)]
+    pub code: i32,
+    pub lines_evaluated: u64,
+    pub decisions_written: u64,
+    pub rejected: u64,
+    pub ledger_seq: u64,
+    pub ledger_epoch: u64,
+    pub stopped: Option<&'static str>,
+}
+
+/// `check` result. Text mode prints the old `key=value` lines and the plan.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckReport {
+    #[serde(skip)]
+    pub code: i32,
+    pub mode: &'static str,
+    pub enabled: bool,
+    pub rules: usize,
+    pub seal: &'static str,
+    pub caps: String,
+    pub plan: Option<String>,
+    pub plan_error: Option<String>,
+    pub enforce_blocked: bool,
+}
+
+pub fn check(loaded: &Loaded) -> CheckReport {
     let seal = loaded.seal_status();
     let plan = cveguard_proto::isolate::plan(&loaded.isolate);
-    println!("mode={}", mode_word(loaded.mode));
-    println!("enabled={}", if loaded.enabled { "yes" } else { "no" });
-    println!("rules={}", loaded.rules.len());
-    println!("seal={}", seal_word(seal));
-    println!(
-        "caps={}",
-        crate::caps::format_plan(&crate::caps::debut_plan())
-    );
-    match &plan {
-        Ok(text) => println!("{text}"),
-        Err(err) => eprintln!("isolate: {err}"),
-    }
     let bad_seal = seal == SealStatus::Mismatch;
     let enforce_blocked =
         loaded.mode == Mode::Enforce && (seal != SealStatus::Valid || plan.is_err());
-    if bad_seal || enforce_blocked {
-        Ok(3)
-    } else {
-        Ok(0)
+    let (plan, plan_error) = match plan {
+        Ok(text) => (Some(text), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    CheckReport {
+        code: if bad_seal || enforce_blocked { 3 } else { 0 },
+        mode: mode_word(loaded.mode),
+        enabled: loaded.enabled,
+        rules: loaded.rules.len(),
+        seal: seal_word(seal),
+        caps: crate::caps::format_plan(&crate::caps::debut_plan()),
+        plan,
+        plan_error,
+        enforce_blocked,
     }
 }
 
@@ -244,12 +302,13 @@ fn seal_word(seal: SealStatus) -> &'static str {
 
 /// Bad lines become `rejected` / `schema` rows; the rest of the batch is
 /// still evaluated. Exit 2 when any row was rejected.
-pub fn once(loaded: Loaded, input: &Path) -> Result<i32, Error> {
+pub fn once(loaded: Loaded, input: &Path) -> Result<OnceSummary, Error> {
     let mut runtime = Runtime::new(loaded)?;
     if let Some(code) = runtime.gate()? {
-        return Ok(code);
+        return Ok(runtime.summary(code, 0));
     }
     let lines = parse_once(input)?;
+    let lines_evaluated = u64::try_from(lines.len()).unwrap_or(u64::MAX);
     let now = now_ms()?;
     let mut rejected = false;
     for line in lines {
@@ -268,7 +327,22 @@ pub fn once(loaded: Loaded, input: &Path) -> Result<i32, Error> {
         rejected |= hit;
     }
     runtime.write_status()?;
-    if rejected { Ok(2) } else { Ok(0) }
+    Ok(runtime.summary(if rejected { 2 } else { 0 }, lines_evaluated))
+}
+
+impl Runtime {
+    fn summary(&self, code: i32, lines_evaluated: u64) -> OnceSummary {
+        let stats = self.ledger.stats();
+        OnceSummary {
+            code,
+            lines_evaluated,
+            decisions_written: self.written,
+            rejected: self.rejected_rows,
+            ledger_seq: stats.head.seq,
+            ledger_epoch: stats.head.epoch,
+            stopped: if code == 3 { self.stop } else { None },
+        }
+    }
 }
 
 /// One entry per non-empty line: `Some(event)`, or `None` for a line that

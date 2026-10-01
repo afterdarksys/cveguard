@@ -104,6 +104,11 @@ pub struct Shipper {
     cfg: ShipConfig,
     cursor: Cursor,
     backoff: Duration,
+    /// Passes that ended on a retry ack, unknown ack, or socket error, since
+    /// this process started (not kept in the cursor file).
+    retried: u64,
+    last_error: Option<String>,
+    last_error_at_ms: Option<i64>,
 }
 
 struct Row {
@@ -120,7 +125,42 @@ impl Shipper {
             cfg,
             cursor,
             backoff: Duration::ZERO,
+            retried: 0,
+            last_error: None,
+            last_error_at_ms: None,
         })
+    }
+
+    /// Records a failure for the status file. `message` must not carry row
+    /// contents.
+    pub fn note_error(&mut self, message: String, now_ms: i64) {
+        self.last_error = Some(message);
+        self.last_error_at_ms = Some(now_ms);
+    }
+
+    /// The `ship` status payload (envelope added by `status::write`).
+    #[must_use]
+    pub fn status_payload(&self) -> Value {
+        serde_json::json!({
+            "daemon": "ship",
+            "sent": self.cursor.sent,
+            "refused": self.cursor.refused,
+            "missed": self.cursor.missed,
+            "retried": self.retried,
+            "cursor": {"epoch": self.cursor.epoch, "seq": self.cursor.seq},
+            "backoff_ms": u64::try_from(self.backoff.as_millis()).unwrap_or(u64::MAX),
+            "last_error": self.last_error,
+            "last_error_at_ms": self.last_error_at_ms,
+        })
+    }
+
+    /// Writes `<cursor>.status.json`.
+    pub fn write_status(&self, now_ms: i64) -> Result<(), Error> {
+        crate::status::write(
+            &crate::status::ship_path(&self.cfg.cursor),
+            self.status_payload(),
+            now_ms,
+        )
     }
 
     #[must_use]
@@ -150,7 +190,14 @@ impl Shipper {
                     Ok(ACK_REFUSED) => ACK_REFUSED,
                     // ACK_RETRY, an unknown byte, no byte, or an I/O error:
                     // the row was not taken; keep the cursor and resend it.
-                    Ok(_) | Err(_) => {
+                    other => {
+                        let why = match other {
+                            Ok(ACK_RETRY) => "darksignal answered retry".to_owned(),
+                            Ok(byte) => format!("darksignal sent unknown ack 0x{byte:02x}"),
+                            Err(err) => format!("socket: {}", err.kind()),
+                        };
+                        self.note_error(why, now_ms);
+                        self.retried = self.retried.saturating_add(1);
                         pass.failed = true;
                         self.backoff = next_backoff(self.backoff);
                         return Ok(pass);
@@ -160,6 +207,10 @@ impl Shipper {
                 None => ACK_REFUSED,
             };
             if ack == ACK_REFUSED {
+                self.note_error(
+                    format!("darksignal refused row {}:{}", row.epoch, row.seq),
+                    now_ms,
+                );
                 eprintln!(
                     "afterguard: ship: darksignal REFUSED row {}:{}; it is lost, check the row",
                     row.epoch, row.seq
@@ -243,8 +294,20 @@ fn send(socket: &Path, frame: &[u8]) -> std::io::Result<u8> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    write_and_read_ack(&mut stream, frame)
+}
+
+/// darksignal frames are length-prefixed, so it can read the frame, ack and
+/// shut the connection down before our `shutdown(Write)`. BSD then answers
+/// that shutdown with `ENOTCONN` while the ack byte is still readable; that
+/// error must not discard the ack, or an accepted row is resent and a refused
+/// row is retried instead of skipped.
+fn write_and_read_ack(stream: &mut UnixStream, frame: &[u8]) -> std::io::Result<u8> {
     stream.write_all(frame)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    match stream.shutdown(std::net::Shutdown::Write) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotConnected => return Err(e),
+        _ => {}
+    }
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack)?;
     Ok(ack[0])
@@ -585,5 +648,23 @@ mod tests {
         let frames: Vec<Value> = rx.iter().take(2).collect();
         assert_eq!(seqs(&frames), vec![1, 1]);
         assert_ne!(frames[0]["body"]["epoch"], frames[1]["body"]["epoch"]);
+    }
+
+    #[test]
+    fn ack_survives_peer_closing_before_our_shutdown() {
+        for want in [ACK_ACCEPTED, ACK_REFUSED, ACK_RETRY] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            // The whole frame is already written; the peer reads it, acks and
+            // shuts down before write_and_read_ack reaches shutdown(Write).
+            client.write_all(&[7u8; 16]).unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut got = [0u8; 16];
+                server.read_exact(&mut got).unwrap();
+                server.write_all(&[want]).unwrap();
+                server.shutdown(std::net::Shutdown::Both).unwrap();
+            });
+            peer.join().unwrap();
+            assert_eq!(write_and_read_ack(&mut client, &[]).unwrap(), want);
+        }
     }
 }

@@ -276,6 +276,27 @@ mod tests {
         );
     }
 
+    /// afterguard's status.json now carries the output-contract envelope
+    /// (`schema_version`, `kind`, `tool`, `tool_version`, `updated_at_ms`,
+    /// `daemon`). The gauges reader must still take it. The fixture's key
+    /// set is pinned to what afterguard writes by afterguard's cli test.
+    #[test]
+    fn envelope_status_file_still_feeds_the_gauges() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cveguard-proto/testdata/status_run.json");
+        let dir = tempfile::tempdir().unwrap();
+        let gauges = dir.path().join("status.json");
+        write_0600(&gauges, &std::fs::read(&fixture).unwrap());
+        let snapshot = load_snapshot(&dir.path().join("decisions.jsonl"), Some(&gauges)).unwrap();
+        let text = render(&snapshot);
+        assert!(text.contains("cveguard_rules_loaded 3\n"));
+        assert!(text.contains("cveguard_ring_lost 5\n"));
+        assert!(text.contains("cveguard_feed_bad_lines 4\n"));
+        assert!(text.contains("cveguard_feed_events_replaced 1\n"));
+        assert!(text.contains("cveguard_feed_gaps 2\n"));
+        assert!(!text.contains("afterguard.status"));
+    }
+
     #[test]
     fn feed_series_are_zero_without_status() {
         let dir = tempfile::tempdir().unwrap();

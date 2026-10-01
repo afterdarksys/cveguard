@@ -1,0 +1,1 @@
+{"schema_version":1,"kind":"afterguard.status","tool":"afterguard","tool_version":"0.1.0","bad_lines":4,"daemon":"run","enforce_enabled":0,"events_gap":2,"events_replaced":1,"ledger_drops":0,"ledger_epoch":0,"ledger_head":"","ledger_rotations":0,"ledger_seq":0,"ring_lost":5,"rules_loaded":3,"tamper_mismatch":0,"updated_at_ms":1790889672525}

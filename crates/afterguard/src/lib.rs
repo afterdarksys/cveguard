@@ -15,6 +15,7 @@ pub mod ledger;
 pub mod lineage;
 pub mod run;
 pub mod ship;
+pub mod status;
 pub mod tail;
 
 pub use dispatch::dispatch;

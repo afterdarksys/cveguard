@@ -60,6 +60,7 @@ afterguard check --config deploy/config.example.json
 afterguard once --config deploy/config.example.json --input events.jsonl
 afterguard run --config /etc/cveguard/config.json
 afterguard ship --config /etc/cveguard/config.json
+afterguard status --config /etc/cveguard/config.json [--json]
 afterguard isolate plan --config deploy/config.example.json
 afterguard isolate deactivate
 afterguard isolate apply
@@ -85,8 +86,9 @@ the chain check cannot detect truncation of the newest rows. A missing gauges
 file is treated as empty; a symlinked or group-writable one fails the scrape.
 
 `afterseal pin` must cover all six toolchain binaries; an empty or partial
-manifest is a mismatch. `verify --json` and `census --json` print
-`{"status":"valid|missing|mismatch","reason":"sealed|seal_missing|seal_mismatch"}`;
+manifest is a mismatch. `verify --json` and `census --json` print the
+output envelope plus
+`"status":"valid|missing|mismatch","reason":"sealed|seal_missing|seal_mismatch"`;
 `census` also lists each binary. `census` hashes the files; it is a report,
 not an allow list.
 
@@ -103,3 +105,80 @@ enforce was refused (missing seal or a plan that cannot be rendered). Exit `2` m
 (bad event or bad `once` line, which is recorded as a `rejected` row, a
 `feed_gap` row, or an isolate match whose plan cannot be rendered). Shadow with
 a missing seal can `check` and `once`.
+
+## CLI output and exit codes
+
+Contract: [`docs/output-contract.md`](docs/output-contract.md). Every command
+of `afterguard`, `afteralert`, and `afterseal` accepts `--json` (alias
+`--format json`; `--format text` is the default). With `--json`, stdout is
+exactly one compact JSON object, newline-terminated; the daemons (`run`,
+`ship`, `serve`) print nothing on stdout. Diagnostics go to stderr. There
+are no machine-primary commands: every command defaults to human text.
+
+Every document starts with the envelope:
+
+```json
+{"schema_version":1,"kind":"afterguard.check","tool":"afterguard","tool_version":"0.1.0", ...}
+```
+
+| Command | Default | `kind` | Exit codes |
+| --- | --- | --- | --- |
+| `afterguard version` | human | `afterguard.version` | 0, 1 |
+| `afterguard check --config P` | human (`key=value` lines, then the plan) | `afterguard.check` | 0, 1, 3 (seal mismatch or enforce blocked; result still printed) |
+| `afterguard once --config P --input P` | human (`key=value` summary) | `afterguard.once` | 0, 1, 2 (a row was rejected), 3 (seal or enforce gate; summary still printed with `stopped`) |
+| `afterguard run --config P` | daemon, no stdout | status file `afterguard.status` | 1, 3 (integrity stop; stderr says why) |
+| `afterguard ship --config P` | daemon, no stdout | status file `afterguard.status` | 1 |
+| `afterguard status --config P` | human (one line per daemon) | `afterguard.status` | 0, 1, 11 (a configured daemon's status is missing or stale) |
+| `afterguard isolate plan --config P` | human (the recipe) | `afterguard.isolate.plan` | 0, 1, 3 (plan cannot be rendered; JSON error) |
+| `afterguard isolate deactivate` | human | `afterguard.isolate.deactivate` | 0 |
+| `afterguard isolate apply` | always an error | `error`, category `refused` | 1 |
+| `afteralert version` | human | `afteralert.version` | 0, 1 |
+| `afteralert serve ...` | daemon, no stdout | `/metrics` is its status | 1 |
+| `afterseal version` | human | `afterseal.version` | 0, 1 |
+| `afterseal pin --out P --path B ...` | human (`pinned N entries to P`) | `afterseal.pin` | 0, 1 |
+| `afterseal verify --seal P` | human (status word) | `afterseal.verify` | 0, 1, 3 (missing or mismatch; result still printed) |
+| `afterseal census --seal P` | human (`name status` lines) | `afterseal.census` | 0, 1, 3 (missing or mismatch; result still printed) |
+
+`<tool> --help`, `<tool> <command> --help`, `-h`, and `<tool> help [command]`
+print usage, flags, and exit codes on stdout and exit 0. `<tool> --version`
+works like `version`. An unknown command, flag, or a repeated flag is a usage
+error.
+
+Exit `1` is every error, including usage and config errors, as it was before
+the contract (`2` already means "a decision was rejected" in afterguard).
+Exit `3` is an integrity stop or permanent refusal. Exit `11` is
+`afterguard status` reporting a missing or stale daemon.
+
+Errors: in `--json` mode every failure, including usage errors, is one line
+on stderr and nothing on stdout:
+
+```json
+{"schema_version":1,"kind":"error","tool":"afterguard","command":"check","category":"config","message":"config: No such file or directory (os error 2)","exit_code":1}
+```
+
+`category` is `usage`, `config`, `io`, `refused`, `integrity`, or
+`internal` here. `command` is the dotted command (`isolate.plan`) or `null`.
+In text mode the error is one line, `<tool>: <message>`. Control and bidi
+characters in messages are escaped.
+
+Status files (mode 0600, written atomically, `kind` `afterguard.status`,
+`updated_at_ms`, and `daemon`):
+
+- `afterguard run` (and `once`) writes the config's `status` path
+  (`/var/lib/cveguard/status.json` in the example) every pass, about once a
+  second, and before it stops. The envelope fields and `daemon`,
+  `updated_at_ms`, and `stop_reason` (when stopped) were added; every
+  earlier field is unchanged, and `afteralert --gauges` reads it as before.
+- `afterguard ship` writes `<cursor>.status.json`
+  (`/var/lib/cveguard/ship.cursor.status.json` by default) after every pass,
+  at least every 10 s during a backoff, and before a fatal error: `sent`,
+  `refused`, `missed` (from the cursor), `retried` (since this process
+  started), `cursor` `{epoch, seq}`, `backoff_ms`, `last_error`,
+  `last_error_at_ms`. A kill signal does not write a final status; the file
+  then goes stale.
+- `afterguard status --config P [--json]` reads both without any lock and
+  reports `stale: true` when `updated_at_ms` is missing or more than 30 s
+  (three write intervals) away from now. A status file that is a symlink or
+  group/other writable is an `io` error; one that is not JSON is `integrity`.
+- `afteralert serve` has no status file: a successful `/metrics` scrape is
+  its health.

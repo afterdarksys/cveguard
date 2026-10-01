@@ -2,12 +2,6 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match afterseal::dispatch(&args) {
-        Ok(code) => code,
-        Err(err) => {
-            eprintln!("afterseal: {err}");
-            1
-        }
-    };
-    std::process::exit(code);
+    let result = afterseal::dispatch(&args);
+    std::process::exit(cveguard_proto::cli::finish("afterseal", &args, result));
 }
