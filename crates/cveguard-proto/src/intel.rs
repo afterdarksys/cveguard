@@ -789,6 +789,29 @@ mod tests {
     }
 
     #[test]
+    fn stamps_darksignal_would_refuse_are_rejected_at_ingest() {
+        let line = |ms: i64| {
+            serde_json::json!({
+                "observed_at_ms": ms, "source": "proc", "kind": "process.start",
+                "pid": 7, "name": "xmrig", "exe": "/tmp/xmrig"
+            })
+            .to_string()
+        };
+        let max = crate::model::MAX_TIME_MS;
+        for ms in [0, 1, 1_790_869_200_000, max] {
+            let ev = ingest_line(&line(ms)).unwrap().unwrap();
+            assert_eq!(ev.observed_at_ms, ms);
+        }
+        for ms in [-1, i64::MIN, max + 1, i64::MAX] {
+            let err = ingest_line(&line(ms)).unwrap_err();
+            assert!(err.to_string().contains("time rejected"), "{ms}: {err}");
+        }
+        // Guard JSON is held to the same range.
+        let guard = r#"{"schema_version":1,"kind":"exec","exe":"/tmp/x","observed_at_ms":-5}"#;
+        assert!(ingest_line(guard).is_err());
+    }
+
+    #[test]
     fn nocved_listen_and_ipv6_net_lines_are_accepted() {
         for (local, remote, want) in [
             ("0.0.0.0:22", "0.0.0.0", "0.0.0.0:22"),

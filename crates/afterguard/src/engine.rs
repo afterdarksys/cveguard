@@ -13,7 +13,7 @@
 use cveguard_proto::isolate::{self, IsolateSpec};
 use cveguard_proto::model::{
     Action, ActionBudget, DECISION_SCHEMA_VERSION, Decision, GuardEvent, Kind, Mode, Origin,
-    Outcome, Reason, Rule, Severity, predicate_matches, subject_of, validate_event,
+    Outcome, Reason, Rule, Severity, predicate_matches, subject_of, valid_time, validate_event,
 };
 use cveguard_proto::seal::{SealCheck, SealStatus, Sealed};
 
@@ -411,8 +411,15 @@ fn bare(
 }
 
 fn schema_decision(ev: &GuardEvent) -> Decision {
+    // A stamp darksignal would refuse is written as 0 (unset), so the
+    // rejection itself still ships.
+    let observed_at_ms = if valid_time(ev.observed_at_ms) {
+        ev.observed_at_ms
+    } else {
+        0
+    };
     let mut row = bare(
-        ev.observed_at_ms,
+        observed_at_ms,
         Action::Record,
         Outcome::Rejected,
         Reason::Schema,
@@ -545,6 +552,21 @@ mod tests {
             ActionBudget::new(60_000, max_actions).unwrap(),
             SealCheck::of(seal),
         )
+    }
+
+    #[test]
+    fn out_of_range_stamp_is_a_schema_row_with_an_unset_time() {
+        let mut engine = make(Vec::new(), Mode::Shadow, SealStatus::Valid, 10);
+        for ms in [-1, cveguard_proto::model::MAX_TIME_MS + 1] {
+            let mut ev = exec("/tmp/xmrig", Origin::Ring);
+            ev.observed_at_ms = ms;
+            let row = engine.evaluate(&ev).unwrap();
+            assert_eq!(
+                (row.outcome, row.reason),
+                (Outcome::Rejected, Reason::Schema)
+            );
+            assert_eq!(row.observed_at_ms, 0, "{ms}");
+        }
     }
 
     #[test]

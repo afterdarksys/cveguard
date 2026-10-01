@@ -337,6 +337,17 @@ pub fn normalize_event_comm(ev: &mut GuardEvent) {
     }
 }
 
+/// darksignal's `frame::MAX_TIME_MS` (2100-01-01T00:00:00Z).
+pub const MAX_TIME_MS: i64 = 4_102_444_800_000;
+
+/// darksignal's time range (`frame::valid_time`): 0 (unset) to
+/// `MAX_TIME_MS`. darksignal refuses a row whose `observed_at_ms` is outside
+/// it, so an event with such a stamp is rejected at ingest instead.
+#[must_use]
+pub fn valid_time(ms: i64) -> bool {
+    (0..=MAX_TIME_MS).contains(&ms)
+}
+
 /// A producer rule id: 1..=128 bytes of `[A-Za-z0-9._-]` (darksignal's
 /// rule grammar).
 #[must_use]
@@ -425,6 +436,9 @@ pub fn check_text(s: &str) -> Result<(), Error> {
 pub fn validate_event(ev: &GuardEvent) -> Result<(), Error> {
     if ev.schema_version != SCHEMA_VERSION {
         return Err(schema("schema rejected"));
+    }
+    if !valid_time(ev.observed_at_ms) {
+        return Err(schema("time rejected"));
     }
     if let Some(s) = &ev.exe {
         check_text(s)?;

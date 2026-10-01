@@ -9,6 +9,7 @@
 
 pub mod chain;
 pub mod cidr;
+pub mod counts;
 pub mod error;
 pub mod fs;
 pub mod intel;

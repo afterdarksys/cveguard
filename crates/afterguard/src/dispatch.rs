@@ -61,7 +61,10 @@ pub fn dispatch(args: &[String]) -> Result<i32, Error> {
             loop {
                 let pass = shipper.pass(run::now_ms()?)?;
                 if pass.failed {
-                    eprintln!("afterguard: ship: darksignal socket unavailable, backing off");
+                    eprintln!(
+                        "afterguard: ship: darksignal did not take the row (retry ack, unknown ack, or socket error); backing off {}s",
+                        shipper.wait().as_secs()
+                    );
                 }
                 thread::sleep(shipper.wait());
             }

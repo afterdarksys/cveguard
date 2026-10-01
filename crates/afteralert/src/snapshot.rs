@@ -13,13 +13,19 @@
 //! tail could not parse), `cveguard_feed_events_replaced` (times the feed
 //! path named a new inode), and `cveguard_feed_gaps` (stretches of the feed
 //! the tail lost). Only the numbers are exported, never the lines.
+//!
+//! `cveguard_decisions_total` is cumulative: rows the writer retired from a
+//! discarded `.1` (`<ledger>.retired`) plus `.1` plus the live ledger, all
+//! read under the ledger's shared lock (`cveguard_proto::counts`), so it
+//! never drops on rotation.
 
 use std::path::Path;
 
 use cveguard_proto::Error;
 use cveguard_proto::chain::{self, ChainHead};
+use cveguard_proto::counts::{self, Cumulative, slot};
 use cveguard_proto::fs::{self, FilePolicy};
-use cveguard_proto::model::{Action, MAX_LEDGER_BYTES, Outcome};
+use cveguard_proto::model::{Action, Outcome};
 use serde::Deserialize;
 
 const ACTIONS: [Action; 3] = [Action::Record, Action::Alert, Action::Isolate];
@@ -44,12 +50,6 @@ pub struct Snapshot {
     feed_bad_lines: u64,
     feed_events_replaced: u64,
     feed_gaps: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct Counted {
-    action: Action,
-    outcome: Outcome,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,12 +77,16 @@ struct Gauges {
 }
 
 pub fn load_snapshot(ledger: &Path, gauges: Option<&Path>) -> Result<Snapshot, Error> {
-    let (decisions, ledger_parse_errors, current) = load_ledger(ledger)?;
+    let Cumulative {
+        decisions,
+        live_parse_errors: ledger_parse_errors,
+        rotated,
+        current,
+    } = counts::load(ledger)?;
     let gauge = match gauges {
         Some(path) => load_gauges(path)?,
         None => Gauges::default(),
     };
-    let rotated = read_ledger_file(&rotated_path(ledger))?;
     let expect = ChainHead {
         epoch: 0,
         seq: gauge.ledger_seq,
@@ -116,95 +120,6 @@ fn load_gauges(path: &Path) -> Result<Gauges, Error> {
         Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(Gauges::default()),
         Err(err) => Err(err),
     }
-}
-
-fn rotated_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".1");
-    std::path::PathBuf::from(name)
-}
-
-/// Ledger bytes under the 0600 / size / nofollow policy; `None` if absent.
-fn read_ledger_file(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    match fs::read_trusted(path, MAX_LEDGER_BYTES, FilePolicy::Secret0600) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-type LedgerCounts = ([u64; 15], u64, Option<Vec<u8>>);
-
-fn load_ledger(path: &Path) -> Result<LedgerCounts, Error> {
-    let Some(bytes) = read_ledger_file(path)? else {
-        return Ok(([0; 15], 0, None));
-    };
-    let mut decisions = [0u64; 15];
-    let mut errors = 0u64;
-    for_each_line(&bytes, |line| match count_line(line) {
-        LineCount::Skip => {}
-        LineCount::Hit(action, outcome) => {
-            decisions[slot(action, outcome)] = decisions[slot(action, outcome)].saturating_add(1);
-        }
-        LineCount::Bad => errors = errors.saturating_add(1),
-    });
-    Ok((decisions, errors, Some(bytes)))
-}
-
-enum LineCount {
-    Skip,
-    Hit(Action, Outcome),
-    Bad,
-}
-
-fn count_line(line: &[u8]) -> LineCount {
-    let Ok(text) = std::str::from_utf8(line) else {
-        return LineCount::Bad;
-    };
-    if text.trim().is_empty() {
-        return LineCount::Skip;
-    }
-    match serde_json::from_str::<Counted>(text) {
-        Ok(row) => LineCount::Hit(row.action, row.outcome),
-        Err(_) => LineCount::Bad,
-    }
-}
-
-fn for_each_line(bytes: &[u8], mut visit: impl FnMut(&[u8])) {
-    let mut start = 0usize;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'\n' {
-            continue;
-        }
-        visit(trim_cr(&bytes[start..index]));
-        start = index + 1;
-    }
-    if start < bytes.len() {
-        visit(trim_cr(&bytes[start..]));
-    }
-}
-
-fn trim_cr(line: &[u8]) -> &[u8] {
-    match line.split_last() {
-        Some((b'\r', head)) => head,
-        _ => line,
-    }
-}
-
-fn slot(action: Action, outcome: Outcome) -> usize {
-    let action_index = match action {
-        Action::Record => 0,
-        Action::Alert => 1,
-        Action::Isolate => 2,
-    };
-    let outcome_index = match outcome {
-        Outcome::Shadow => 0,
-        Outcome::Noted => 1,
-        Outcome::Planned => 2,
-        Outcome::Suppressed => 3,
-        Outcome::Rejected => 4,
-    };
-    action_index * 5 + outcome_index
 }
 
 fn action_label(action: Action) -> &'static str {
@@ -283,6 +198,7 @@ fn push_gauge(out: &mut String, name: &str, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cveguard_proto::model::MAX_LEDGER_BYTES;
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -339,6 +255,25 @@ mod tests {
         );
         assert!(text.contains("cveguard_feed_events_replaced 23\n"));
         assert!(text.contains("cveguard_feed_gaps 4\n"));
+    }
+
+    #[test]
+    fn decisions_total_includes_retired_and_rotated_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("decisions.jsonl");
+        let row = b"{\"action\":\"alert\",\"outcome\":\"shadow\"}\n";
+        write_0600(
+            &counts::retired_path(&ledger),
+            br#"{"mark":"","counts":[0,0,0,0,0,40,0,0,0,0,0,0,0,0,0]}"#,
+        );
+        let mut rotated = ledger.as_os_str().to_owned();
+        rotated.push(".1");
+        write_0600(Path::new(&rotated), &row.repeat(2));
+        write_0600(&ledger, row);
+        let text = render(&load_snapshot(&ledger, None).unwrap());
+        assert!(
+            text.contains("cveguard_decisions_total{action=\"alert\",outcome=\"shadow\"} 43\n")
+        );
     }
 
     #[test]

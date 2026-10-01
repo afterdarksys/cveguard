@@ -17,7 +17,9 @@
 //! `<ledger>.1` (replacing the previous `.1`) and the new file continues the
 //! chain from the old head. A single row larger than `ledger_max` is dropped
 //! and counted. Not covered: only one rotated generation is kept, so the
-//! second rotation discards the oldest rows; collect `.1` before then.
+//! second rotation discards the oldest rows; collect `.1` before then. Their
+//! per-action/outcome counts are kept in `<ledger>.retired` first
+//! (`cveguard_proto::counts`), so `cveguard_decisions_total` never drops.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use cveguard_proto::Error;
 use cveguard_proto::chain::{self, ChainHead};
+use cveguard_proto::counts;
 use cveguard_proto::fs::{self, FilePolicy};
 use cveguard_proto::model::{Decision, MAX_LEDGER_BYTES};
 
@@ -98,6 +101,9 @@ impl Ledger {
         };
         let current = usize::try_from(current).unwrap_or(usize::MAX);
         if current.saturating_add(line.len()) > self.max {
+            // The old `.1` is about to go: fold its rows into the cumulative
+            // counts first, under this lock.
+            counts::retire_rotated(&self.path)?;
             std::fs::rename(&self.path, rotated(&self.path))?;
             self.stats.rotations = self.stats.rotations.saturating_add(1);
         }
@@ -313,6 +319,36 @@ mod tests {
             .append(&sample())
             .unwrap_err();
         assert!(err.to_string().contains("symlink rejected"));
+    }
+
+    #[test]
+    fn decision_counter_is_monotonic_across_three_rotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let widest = ChainHead {
+            epoch: chain::MAX_EPOCH,
+            seq: 99,
+            head: chain::GENESIS.to_owned(),
+        };
+        let row_len = chain::chain_line(&sample(), &widest).unwrap().len() + 1;
+        // Two rows per file: rows 3, 5 and 7 each rotate.
+        let mut ledger = Ledger::new(path.clone(), row_len * 2).unwrap();
+        let mut last = 0u64;
+        for written in 1..=8u64 {
+            ledger.append(&sample()).unwrap();
+            let got = counts::load(&path).unwrap();
+            let total: u64 = got.decisions.iter().sum();
+            assert!(total >= last, "counter fell from {last} to {total}");
+            assert_eq!(total, written);
+            last = total;
+        }
+        assert_eq!(ledger.stats().rotations, 3);
+        let got = counts::load(&path).unwrap();
+        assert_eq!(
+            got.decisions[counts::slot(Action::Alert, Outcome::Shadow)],
+            8
+        );
+        assert!(counts::retired_path(&path).exists());
     }
 
     #[test]

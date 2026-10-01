@@ -3,9 +3,17 @@
 //! Each row of `<ledger>.1` then `<ledger>` that comes after the cursor is
 //! sent as one frame on its own connection: a u32 little-endian length, then
 //! `{"v":1,"tool":"cveguard","host","sent_at_ms","body":<row>}`, at most
-//! 64 KiB. darksignal answers one byte: 0x01 accepted, 0x00 refused. Both
-//! advance the cursor; a refusal is counted. A socket error, a timeout, or
-//! any other byte keeps the cursor and backs off (1 s doubling to 300 s).
+//! 64 KiB. darksignal answers one byte:
+//!
+//! - `0x01` accepted (stored, duplicate, evicted-older, or dropped by the
+//!   classifier): advance the cursor.
+//! - `0x00` refused, permanent and the producer's fault (a malformed frame or
+//!   a field that fails validation): advance the cursor, count `refused`, and
+//!   log the row's `{epoch}:{seq}`. The row is lost by design.
+//! - `0x02` retry (darksignal could not identify the peer, its queue was
+//!   full, or its store failed), any other byte, no byte, a timeout, or an
+//!   I/O error: keep the cursor, back off (1 s doubling to 60 s), and send
+//!   the same row again. One accepted or refused row resets the backoff.
 //!
 //! The cursor is the `(epoch, seq)` of the last row handed over, kept in a
 //! 0600 file written atomically after every row. The rows to send start after
@@ -13,8 +21,9 @@
 //! the cursor; with no such row (a new ledger, or both generations newer than
 //! the cursor) every row is sent, and a jump past `seq + 1` in the same epoch
 //! is counted as `missed`. Delivery is at least once: a crash between the ack
-//! and the cursor write resends one row, and darksignal dedupes on
-//! `{epoch}:{seq}`. Both generations are read under a shared lock on the
+//! and the cursor write, or a lost ack, resends a row. darksignal keys a
+//! cveguard row's dedupe hash on the row's `{epoch}:{seq}`, so the resend is
+//! acked `0x01` as a duplicate and stored once. Both generations are read under a shared lock on the
 //! ledger's `.lock`, so a rotation cannot fall between the two reads.
 //!
 //! Threats: the cursor file is refused if it is a symlink or not 0600, and a
@@ -41,10 +50,11 @@ use crate::ledger;
 pub const MAX_FRAME: usize = 64 * 1024;
 pub const ACK_ACCEPTED: u8 = 0x01;
 pub const ACK_REFUSED: u8 = 0x00;
+pub const ACK_RETRY: u8 = 0x02;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(1);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
-const BACKOFF_CAP: Duration = Duration::from_secs(300);
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
 const CURSOR_MAX: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -54,14 +64,18 @@ pub struct ShipConfig {
     pub cursor: PathBuf,
 }
 
-/// darksignal's host grammar: 1..=64 of `[A-Za-z0-9._-]`, no edge dot.
+/// darksignal's host grammar (`frame::valid_host`): 1..=253 bytes of
+/// dot-separated labels, each 1..=63 bytes of `[A-Za-z0-9_-]`, so no empty,
+/// leading, or trailing label.
 #[must_use]
 pub fn valid_host(s: &str) -> bool {
-    (1..=64).contains(&s.len())
-        && !s.starts_with('.')
-        && !s.ends_with('.')
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    (1..=253).contains(&s.len())
+        && s.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +148,8 @@ impl Shipper {
                 Some(bytes) => match send(&self.cfg.socket, &bytes) {
                     Ok(ACK_ACCEPTED) => ACK_ACCEPTED,
                     Ok(ACK_REFUSED) => ACK_REFUSED,
+                    // ACK_RETRY, an unknown byte, no byte, or an I/O error:
+                    // the row was not taken; keep the cursor and resend it.
                     Ok(_) | Err(_) => {
                         pass.failed = true;
                         self.backoff = next_backoff(self.backoff);
@@ -143,6 +159,12 @@ impl Shipper {
                 // Over 64 KiB can never be accepted: count it as refused.
                 None => ACK_REFUSED,
             };
+            if ack == ACK_REFUSED {
+                eprintln!(
+                    "afterguard: ship: darksignal REFUSED row {}:{}; it is lost, check the row",
+                    row.epoch, row.seq
+                );
+            }
             if row.epoch == self.cursor.epoch && row.seq > self.cursor.seq.saturating_add(1) {
                 self.cursor.missed = self
                     .cursor
@@ -454,6 +476,55 @@ mod tests {
     }
 
     #[test]
+    fn retry_and_unknown_acks_keep_the_cursor_and_resend_the_row() {
+        let (f, mut writer) = fix(1024 * 1024);
+        for pid in 1..=3 {
+            writer.append(&row(pid)).unwrap();
+        }
+        let rx = server(
+            &f.cfg.socket,
+            vec![Some(ACK_RETRY), Some(0x7f), Some(1), Some(1), Some(1)],
+        );
+        let mut shipper = Shipper::new(f.ledger.clone(), f.cfg.clone()).unwrap();
+        // 0x02: transient; nothing advances and nothing is counted.
+        let pass = shipper.pass(1).unwrap();
+        assert_eq!(
+            pass,
+            Pass {
+                sent: 0,
+                refused: 0,
+                failed: true
+            }
+        );
+        assert_eq!(shipper.cursor(), Cursor::default());
+        assert!(!f.cfg.cursor.exists());
+        assert_eq!(shipper.wait(), Duration::from_secs(1));
+        // An unknown byte is treated exactly like 0x02.
+        assert!(shipper.pass(2).unwrap().failed);
+        assert_eq!(shipper.cursor(), Cursor::default());
+        assert_eq!(shipper.wait(), Duration::from_secs(2));
+        // 0x01 advances; the backoff resets.
+        let pass = shipper.pass(3).unwrap();
+        assert_eq!(pass.sent, 3);
+        assert_eq!(shipper.cursor().seq, 3);
+        assert_eq!(shipper.cursor().refused, 0);
+        assert_eq!(shipper.wait(), Duration::from_secs(1));
+        // Row 1 went out three times: the retried row is the same row.
+        let frames: Vec<Value> = rx.iter().take(5).collect();
+        assert_eq!(seqs(&frames), vec![1, 1, 1, 2, 3]);
+        assert_eq!(frames[0]["body"], frames[2]["body"]);
+    }
+
+    #[test]
+    fn backoff_is_capped_at_sixty_seconds() {
+        let mut cur = Duration::ZERO;
+        for _ in 0..20 {
+            cur = next_backoff(cur);
+        }
+        assert_eq!(cur, Duration::from_secs(60));
+    }
+
+    #[test]
     fn hostile_cursor_and_oversize_frames_fail_closed() {
         let (f, _writer) = fix(1024 * 1024);
         std::fs::write(&f.cfg.cursor, br#"{"epoch":1,"seq":2}"#).unwrap();
@@ -475,7 +546,29 @@ mod tests {
         let n = u32::from_le_bytes(ok[..4].try_into().unwrap());
         assert_eq!(usize::try_from(n).unwrap(), ok.len() - 4);
         assert!(valid_host("ns2"));
+        assert!(valid_host("ns2.after-dark_systems.example"));
+        assert!(valid_host(
+            &[
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(61)
+            ]
+            .join(".")
+        ));
+        assert!(!valid_host(
+            &[
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(62)
+            ]
+            .join(".")
+        ));
+        assert!(!valid_host(&"a".repeat(64)));
         assert!(!valid_host(".ns2"));
+        assert!(!valid_host("ns2."));
+        assert!(!valid_host("ns2..x"));
         assert!(!valid_host(""));
     }
 
