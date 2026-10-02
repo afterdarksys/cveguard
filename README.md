@@ -53,6 +53,8 @@ cargo deny check
 
 Pinned to Rust 1.97.1. Homebrew `cargo` on this Mac can shadow rustup.
 
+Release builds embed the locked crate list with cargo-auditable 0.7.6: `cargo auditable build --locked --release`. `cargo audit bin` reads that list from `afterguard`, `afteralert`, and `afterseal`.
+
 ## Commands
 
 ```bash

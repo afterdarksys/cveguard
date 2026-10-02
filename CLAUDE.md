@@ -34,4 +34,6 @@ cargo deny check
 ```
 
 The toolchain is pinned to 1.97.1. On this Mac, Homebrew `cargo` can shadow
-rustup; use `rustup run 1.97.1 cargo ...`.
+rustup; use `rustup run 1.97.1 cargo ...`. The GitHub auditable workflow builds
+`afterguard`, `afteralert`, and `afterseal` with cargo-auditable 0.7.6. A plain
+`cargo build --release` does not embed the crate list.

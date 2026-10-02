@@ -1,0 +1,87 @@
+# Release binaries embed the crate list with cargo-auditable 0.7.6.
+# rust-audit-info 0.5.4 must read the root package. cargo audit bin is not a gate.
+name: auditable
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auditable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    name: ubuntu 24.04 ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:24.04
+      options: --platform ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build packages
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config gcc libc6-dev git python3
+
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.97.1
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.97.1 --profile minimal \
+              --component rustfmt,clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Record the host
+        run: |
+          set -euxo pipefail
+          . /etc/os-release
+          echo "OS_ID=${ID}"
+          echo "OS_VERSION_ID=${VERSION_ID}"
+          echo "UNAME=$(uname -srm)"
+          rustc --version
+          test "${ID}" = ubuntu
+          test "${VERSION_ID}" = "24.04"
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          rustc --version | grep -q ' 1.97.1 '
+
+      - name: Install pinned cargo-auditable
+        run: |
+          set -euxo pipefail
+          cargo install cargo-auditable --version 0.7.6 --locked
+          cargo install rust-audit-info --version 0.5.4 --locked
+
+      - name: Release build
+        run: cargo auditable build --locked --release
+
+      - name: Confirm the embedded crate list
+        run: |
+          set -euo pipefail
+          bash scripts/auditable-root.sh \
+            afterguard target/release/afterguard \
+            afteralert target/release/afteralert \
+            afterseal target/release/afterseal
